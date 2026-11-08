@@ -1,0 +1,24 @@
+{
+  "tool_id": "zlibrary",
+  "name": "Z-Library 入库",
+  "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
+  "revision": "1.0.0",
+  "author": "黏菌",
+  "publish_date": "2026-11-08",
+  "core_api_version": "1.3.0",
+  "entry_backend": "tool.ZlibraryTool",
+  "entry_frontend": "index.html",
+  "page": "zlibrary",
+  "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
+  "locales": ["zh", "en", "zh-TW"],
+  "default_locale": "zh",
+  "api_routes": [
+    { "path": "config", "handler": "tool.ConfigHandler" },
+    { "path": "health", "handler": "tool.HealthHandler" },
+    { "path": "accounts", "handler": "tool.AccountsHandler" },
+    { "path": "search", "handler": "tool.SearchHandler" },
+    { "path": "download", "handler": "tool.DownloadHandler" },
+    { "path": "progress", "handler": "tool.ProgressHandler" },
+    { "path": "cancel", "handler": "tool.CancelHandler" }
+  ]
+}

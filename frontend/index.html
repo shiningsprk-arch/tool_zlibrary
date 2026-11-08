@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zlibrary</title>
+  <link rel="stylesheet" href="lib/theme.css" />
+  <style>
+    body { margin: 16px 24px 24px; }
+    h1 { font-size: 1.25em; margin: 0 0 6px; }
+    h2 { font-size: 1.02em; margin: 0 0 10px; }
+    .hint { margin: 4px 0 0; font-size: 0.82em; opacity: .8; }
+    .field-label { display: block; margin: 12px 0 6px; font-size: 0.92em; }
+    .search-row { display: flex; gap: 10px; margin-top: 4px; }
+    .search-row .mb-input { flex: 1; }
+    .panel { border: 1px solid var(--mb-color-border, rgba(128,128,128,.3));
+             border-radius: 12px; padding: 6px 14px 14px; margin-top: 10px; }
+    .filter-grid { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+    .filter-group { min-width: 180px; flex: 1; }
+    .check-row { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: .88em; }
+    .check-row label { display: inline-flex; align-items: center; gap: 4px; }
+    .settings-grid .mb-row + .mb-row { margin-top: 10px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 4px; }
+    .toolbar .spacer { flex: 1; }
+    .result-item { border-bottom: 1px solid var(--mb-color-border, rgba(128,128,128,.25));
+                   padding: 10px 2px; display: flex; gap: 12px; align-items: flex-start; }
+    .result-cover { width: 46px; height: 64px; object-fit: cover; border-radius: 4px;
+                    background: rgba(128,128,128,.12); flex: none; }
+    .ext-chip { flex: none; min-width: 48px; text-align: center; padding: 2px 8px;
+                border-radius: 999px; background: rgba(63,81,181,.12); font-size: .82em;
+                font-weight: 600; }
+    body[data-theme="dark"] .ext-chip { background: rgba(63,81,181,.35); }
+    .result-text { flex: 1; min-width: 0; }
+    .result-title { font-weight: 600; word-break: break-all; }
+    .result-sub { font-size: .85em; opacity: .75; word-break: break-all; }
+    .result-actions { flex: none; }
+    .page-row { display: flex; align-items: center; justify-content: center;
+                gap: 14px; margin-top: 14px; }
+    .account-table { width: 100%; border-collapse: collapse; font-size: .88em; }
+    .account-table th, .account-table td { text-align: left; padding: 7px 6px;
+                border-bottom: 1px solid var(--mb-color-border, rgba(128,128,128,.2));
+                vertical-align: top; }
+    .account-table th { font-weight: 600; opacity: .8; }
+    .status-badge { display: inline-block; padding: 1px 7px; border-radius: 999px;
+                    font-size: .82em; background: rgba(128,128,128,.15); }
+    .status-ok { color: #2e7d32; background: rgba(46,125,50,.12); }
+    .status-exhausted { color: #ed6c02; background: rgba(237,108,2,.12); }
+    .status-invalid { color: #c62828; background: rgba(198,40,40,.12); }
+    .status-error { color: #c62828; background: rgba(198,40,40,.08); }
+    body[data-theme="dark"] .status-ok { color: #81c784; }
+    body[data-theme="dark"] .status-exhausted { color: #ffb74d; }
+    body[data-theme="dark"] .status-invalid, body[data-theme="dark"] .status-error { color: #ef9a9a; }
+    .add-account { border-top: 1px solid var(--mb-color-border, rgba(128,128,128,.2));
+                   margin-top: 14px; padding-top: 8px; }
+    .add-account .mb-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    .add-account .mb-col { flex: 1; min-width: 180px; }
+    .small-btn { padding: 3px 8px; font-size: .82em; margin: 0 4px 4px 0; }
+    .progress-area { margin-top: 12px; }
+    .health-detail { font-size: .84em; white-space: pre-wrap; word-break: break-all; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="mb-container">
+    <h1 data-i18n="title"></h1>
+    <p class="mb-text-secondary" data-i18n="intro"></p>
+
+    <div class="mb-card">
+      <div class="toolbar">
+        <button id="health-btn" class="mb-btn mb-btn--secondary" type="button" data-i18n="healthBtn"></button>
+        <span id="health-status" class="hint"></span>
+        <span class="spacer"></span>
+        <button id="settings-btn" class="mb-btn mb-btn--secondary" type="button" data-i18n="settingsBtn"></button>
+      </div>
+      <div id="health-panel" class="panel" hidden>
+        <div id="health-detail" class="health-detail"></div>
+      </div>
+      <div id="settings-panel" class="panel settings-grid" hidden>
+        <label class="field-label" for="entry-input" data-i18n="entryLabel"></label>
+        <input id="entry-input" class="mb-input" type="text" />
+        <p class="hint" data-i18n="entryHint"></p>
+        <div class="mb-row">
+          <div class="mb-col">
+            <label class="field-label" for="dns-select" data-i18n="dnsModeLabel"></label>
+            <select id="dns-select" class="mb-input">
+              <option value="auto" data-i18n="dnsAuto"></option>
+              <option value="system" data-i18n="dnsSystem"></option>
+              <option value="doh" data-i18n="dnsDoh"></option>
+            </select>
+          </div>
+          <div class="mb-col">
+            <label class="field-label" for="timeout-input" data-i18n="timeoutLabel"></label>
+            <input id="timeout-input" class="mb-input" type="number" min="5" max="120" />
+          </div>
+          <div class="mb-col">
+            <label class="field-label" for="maxmb-input" data-i18n="maxMbLabel"></label>
+            <input id="maxmb-input" class="mb-input" type="number" min="1" max="2048" />
+          </div>
+        </div>
+        <div class="mb-row">
+          <div class="mb-col">
+            <label class="field-label" for="tag-input" data-i18n="tagLabel"></label>
+            <input id="tag-input" class="mb-input" type="text" />
+          </div>
+          <div class="mb-col">
+            <label class="field-label" for="rotation-select" data-i18n="rotationLabel"></label>
+            <select id="rotation-select" class="mb-input">
+              <option value="least_used" data-i18n="rotationLeast"></option>
+              <option value="round_robin" data-i18n="rotationRound"></option>
+            </select>
+          </div>
+        </div>
+        <label class="mb-field" style="margin-top:10px">
+          <input id="guest-input" type="checkbox" />
+          <span data-i18n="guestModeLabel"></span>
+        </label>
+        <p class="hint" data-i18n="guestHint"></p>
+        <button id="save-btn" class="mb-btn" type="button" style="margin-top:12px" data-i18n="saveBtn"></button>
+      </div>
+
+      <div class="search-row">
+        <input id="q-input" class="mb-input" type="text" data-i18n-attr="placeholder:searchPlaceholder" />
+        <button id="search-btn" class="mb-btn" type="button" data-i18n="searchBtn"></button>
+      </div>
+      <button id="adv-btn" class="mb-btn mb-btn--secondary" type="button" style="margin-top:12px" data-i18n="advFilters"></button>
+      <div id="adv-panel" class="panel" hidden>
+        <div class="filter-grid">
+          <div class="filter-group">
+            <label class="field-label" for="lang-select" data-i18n="langLabel"></label>
+            <select id="lang-select" class="mb-input"></select>
+            <label class="field-label" for="order-select" data-i18n="orderLabel"></label>
+            <select id="order-select" class="mb-input"></select>
+          </div>
+          <div class="filter-group">
+            <span class="field-label" data-i18n="extLabel"></span>
+            <div class="check-row" id="ext-checks"></div>
+            <label class="check-row" style="margin-top:10px">
+              <input id="exact-input" type="checkbox" />
+              <span data-i18n="exactLabel"></span>
+            </label>
+          </div>
+          <div class="filter-group">
+            <div class="mb-row">
+              <div class="mb-col">
+                <label class="field-label" for="yearfrom-input" data-i18n="yearFromLabel"></label>
+                <input id="yearfrom-input" class="mb-input" type="number" min="0" max="2200" />
+              </div>
+              <div class="mb-col">
+                <label class="field-label" for="yearto-input" data-i18n="yearToLabel"></label>
+                <input id="yearto-input" class="mb-input" type="number" min="0" max="2200" />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="notice" class="mb-alert mb-alert--warning" hidden></div>
+      <div id="error" class="mb-alert mb-alert--error" hidden></div>
+
+      <div id="progress-area" class="progress-area" hidden>
+        <div id="progress" class="mb-progress-linear mb-progress-linear--indeterminate">
+          <div class="mb-progress-linear__bar"></div>
+        </div>
+        <p id="progress-text" class="hint"></p>
+        <button id="cancel-btn" class="mb-btn mb-btn--secondary" type="button" data-i18n="cancelBtn"></button>
+      </div>
+      <div id="done" class="mb-alert mb-alert--success" hidden style="margin-top:14px">
+        <span id="done-text"></span>
+        <a id="open-book" href="#" target="_blank" rel="noopener"></a>
+      </div>
+
+      <div id="results" hidden style="margin-top:16px">
+        <p id="source-note" class="hint"></p>
+        <div id="result-list"></div>
+        <div class="page-row">
+          <button id="prev-btn" class="mb-btn mb-btn--secondary" type="button" data-i18n="pagePrev"></button>
+          <span id="page-info"></span>
+          <button id="next-btn" class="mb-btn mb-btn--secondary" type="button" data-i18n="pageNext"></button>
+        </div>
+      </div>
+    </div>
+
+    <div class="mb-card" style="margin-top:16px">
+      <div class="toolbar">
+        <h2 style="margin:0" data-i18n="accountsTitle"></h2>
+        <span class="spacer"></span>
+        <span id="account-summary" class="hint"></span>
+        <button id="accounts-toggle" class="mb-btn mb-btn--secondary" type="button" data-i18n="accountsToggle"></button>
+      </div>
+      <div id="accounts-panel" class="panel" hidden style="margin-top:10px">
+        <div id="account-list"></div>
+        <div class="add-account">
+          <h2 data-i18n="addAccountTitle"></h2>
+          <div class="mb-row">
+            <div class="mb-col">
+              <label class="field-label" for="account-label" data-i18n="accountLabel"></label>
+              <input id="account-label" class="mb-input" type="text" />
+            </div>
+            <div class="mb-col">
+              <label class="field-label" for="account-mode" data-i18n="accountMode"></label>
+              <select id="account-mode" class="mb-input">
+                <option value="password" selected data-i18n="modePassword"></option>
+                <option value="cookie" data-i18n="modeCookie"></option>
+              </select>
+            </div>
+          </div>
+          <div id="cookie-fields" hidden>
+            <div class="mb-row">
+              <div class="mb-col">
+                <label class="field-label" for="remix-userid" data-i18n="remixUserId"></label>
+                <input id="remix-userid" class="mb-input" type="text" autocomplete="off" />
+              </div>
+              <div class="mb-col">
+                <label class="field-label" for="remix-userkey" data-i18n="remixUserKey"></label>
+                <input id="remix-userkey" class="mb-input" type="password" autocomplete="new-password" />
+              </div>
+              <div class="mb-col">
+                <label class="field-label" for="bsrv-input" data-i18n="bsrvLabel"></label>
+                <input id="bsrv-input" class="mb-input" type="password" autocomplete="new-password" />
+              </div>
+            </div>
+            <p class="hint" data-i18n="cookieHint"></p>
+          </div>
+          <div id="password-fields">
+            <div class="mb-row">
+              <div class="mb-col">
+                <label class="field-label" for="account-email" data-i18n="emailLabel"></label>
+                <input id="account-email" class="mb-input" type="email" autocomplete="username" />
+              </div>
+              <div class="mb-col">
+                <label class="field-label" for="account-password" data-i18n="passwordLabel"></label>
+                <input id="account-password" class="mb-input" type="password" autocomplete="current-password" />
+              </div>
+            </div>
+            <p class="hint" data-i18n="passwordHint"></p>
+          </div>
+          <button id="add-account-btn" class="mb-btn" type="button" style="margin-top:10px" data-i18n="addBtn"></button>
+          <p id="account-notice" class="hint"></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/toolbox-bridge.js"></script>
+  <script src="lib/i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
