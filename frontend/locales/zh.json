@@ -1,6 +1,6 @@
 {
   "title": "Z-Library 入库",
-  "intro": "从 zlib.ch 入口跟随跳转，搜索 Z-Library 并下载入库；支持号池轮换。请仅下载你有权获取的内容。",
+  "intro": "从 zlib.ch 入口跟随跳转，搜索 Z-Library 并下载入库；支持号池轮换。",
   "healthBtn": "测试入口 / 域名",
   "healthRunning": "正在测试入口…",
   "healthOk": "入口正常：{origin}（{mode}）",

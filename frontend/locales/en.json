@@ -1,6 +1,6 @@
 {
   "title": "Z-Library Import",
-  "intro": "Follow the zlib.ch entry, search Z-Library and import downloads. Account pool rotation is supported. Only download content you have the right to access.",
+  "intro": "Follow the zlib.ch entry, search Z-Library and import downloads. Account pool rotation is supported.",
   "healthBtn": "Test entry / domain",
   "healthRunning": "Testing entry…",
   "healthOk": "Entry OK: {origin} ({mode})",

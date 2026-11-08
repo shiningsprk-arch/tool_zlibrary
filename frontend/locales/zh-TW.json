@@ -1,6 +1,6 @@
 {
   "title": "Z-Library 入庫",
-  "intro": "從 zlib.ch 入口跟隨跳轉，搜尋 Z-Library 並下載入庫；支援號池輪換。請僅下載你有權取得的內容。",
+  "intro": "從 zlib.ch 入口跟隨跳轉，搜尋 Z-Library 並下載入庫；支援號池輪換。",
   "healthBtn": "測試入口 / 網域",
   "healthRunning": "正在測試入口…",
   "healthOk": "入口正常：{origin}（{mode}）",

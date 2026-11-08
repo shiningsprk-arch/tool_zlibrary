@@ -3,8 +3,8 @@
 从 `https://zlib.ch/` 入口跟随跳转，搜索 Z-Library 并把选中的书下载入库。
 支持号池轮换（多个 Z-Library 账号的会话轮换与额度查询），仅管理员自用。
 
-> 请仅下载你有权获取的内容；Z-Library 为第三方影子图书馆，可用性、账号条款与
-> 内容合规性由使用者自行负责。多账号轮换可能违反站点条款并导致封号。
+> Z-Library 为第三方影子图书馆，可用性、账号条款与内容合规性由使用者自行负责。
+> 多账号轮换可能违反站点条款并导致封号。
 
 ## 功能
 
@@ -63,7 +63,6 @@
 python -m py_compile backend/*.py
 python -m pytest tests/ -q
 python scripts/build.py          # 纯 Python 打包 + 产物形状校验 + sha256
-python scripts/make_icon.py      # 重新生成 icon.png（可选）
 ```
 
 测试不依赖真实站点或账号：客户端协议、挑战 solver、HTML 解析、号池选择/脱敏、
