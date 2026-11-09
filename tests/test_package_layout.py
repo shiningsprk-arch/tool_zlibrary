@@ -90,7 +90,7 @@ class ManifestTest(unittest.TestCase):
     def test_tool_id_and_versions(self):
         self.assertRegex(self.manifest["tool_id"], TOOL_ID_RE)
         self.assertRegex(self.manifest["revision"], SEMVER_RE)
-        self.assertEqual(self.manifest["revision"], "0.1.0")
+        self.assertEqual(self.manifest["revision"], "0.1.1")
         self.assertRegex(self.manifest["core_api_version"], SEMVER_RE)
 
     def test_repo_url_is_absolute_https(self):
@@ -128,8 +128,8 @@ class PackageLayoutTest(unittest.TestCase):
     def test_frontend_entry_exists(self):
         html = _read(os.path.join(ROOT, "frontend", "index.html"))
         self.assertIn('src="/static/toolbox-bridge.js"', html)
-        self.assertIn('src="lib/i18n.js"', html)
-        self.assertIn('src="app.js"', html)
+        self.assertIn('src="lib/i18n.js', html)
+        self.assertIn('src="app.js', html)
 
     def test_icon_is_png_at_package_root(self):
         icon = os.path.join(ROOT, "icon.png")
@@ -151,6 +151,19 @@ class PackageLayoutTest(unittest.TestCase):
         for rel in ("backend/tool.py", "backend/zlib_client.py", "backend/accounts.py",
                     "LICENSE", "README.md"):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), "缺少 %s" % rel)
+
+    def test_mobile_layout_and_row_progress(self):
+        html = _read(os.path.join(ROOT, "frontend", "index.html"))
+        js = _read(os.path.join(ROOT, "frontend", "app.js"))
+        self.assertIn("@media (max-width: 640px)", html)
+        self.assertIn(".row-progress", html)
+        self.assertIn("overflow-wrap: anywhere", html)
+        self.assertIn("function mountProgress", js)
+        self.assertIn("holder.appendChild(dom.progressArea)", js)
+        # 重新进入工具时只恢复进行中任务，不回放旧 done/error
+        self.assertNotIn(
+            "status === 'completed' || status === 'failed' || status === 'cancelled'",
+            js)
 
     def test_default_account_mode_and_done_link(self):
         html = _read(os.path.join(ROOT, "frontend", "index.html"))

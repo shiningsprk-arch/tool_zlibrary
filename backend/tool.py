@@ -94,7 +94,7 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.1.0",
+            "revision": "0.1.1",
             "author": "黏菌",
             "publish_date": "2026-11-08",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
@@ -533,7 +533,6 @@ class ZlibraryTool(BaseTool):
             self._update(status="completed", progress=100, stage="done",
                          book_id=book_id, current=title,
                          results=[_result_row(filename, "imported", book_id=book_id)])
-            self.add_msg(user_id, "success", _("已入库：%s") % (title or filename))
         except ZlibError as err:
             if err.code == "cancelled":
                 self._finish_cancelled(task_id, user_id)

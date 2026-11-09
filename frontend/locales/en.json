@@ -50,6 +50,7 @@
   "cancelSent": "Cancellation requested",
   "openBook": "Open book",
   "doneMsg": "Imported: {title}",
+  "doneClose": "Close",
   "stagePrepare": "Preparing",
   "stageDownloading": "Downloading",
   "stageImporting": "Importing",

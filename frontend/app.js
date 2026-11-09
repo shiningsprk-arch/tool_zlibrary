@@ -49,6 +49,7 @@
     cancelBtn: el('cancel-btn'),
     done: el('done'),
     doneText: el('done-text'),
+    doneClose: el('done-close'),
     openBook: el('open-book'),
     results: el('results'),
     resultList: el('result-list'),
@@ -88,6 +89,7 @@
     lastProgress: null,
     lastError: null,
     doneTitle: '',
+    doneTimer: null,
   };
 
   // ------------------------------------------------------------------ 基础
@@ -279,6 +281,12 @@
     if (!q || state.searching) {
       return;
     }
+    if (state.running) {
+      renderError({ err: 'task.running' });
+      return;
+    }
+    state.doneTitle = '';
+    hideDone();
     state.q = q;
     state.page = page || 1;
     state.searching = true;
@@ -378,20 +386,53 @@
 
   // ------------------------------------------------------------------ 下载
 
-  function onDownload(token) {
+  function mountProgress(bookToken, row) {
+    row = row || dom.resultList.querySelector(
+      '.result-item[data-book-token="' + bookToken + '"]');
+    if (!row) {
+      return;
+    }
+    var holder = row.querySelector('.row-progress');
+    if (!holder) {
+      holder = document.createElement('div');
+      holder.className = 'row-progress';
+      row.appendChild(holder);
+    }
+    holder.appendChild(dom.progressArea);
+    dom.progressArea.hidden = false;
+  }
+
+  function hideDone() {
+    dom.done.hidden = true;
+    if (state.doneTimer) {
+      clearTimeout(state.doneTimer);
+      state.doneTimer = null;
+    }
+  }
+
+  function showDone() {
+    dom.done.hidden = false;
+    if (state.doneTimer) {
+      clearTimeout(state.doneTimer);
+    }
+    state.doneTimer = setTimeout(hideDone, 8000);
+  }
+
+  function onDownload(token, row) {
     if (state.running) {
       renderError({ err: 'task.running' });
       return;
     }
     renderError(null);
     state.doneTitle = '';
-    dom.done.hidden = true;
+    hideDone();
     dom.openBook.hidden = true;
     postJson('download', { book_token: token }).then(function (rsp) {
       if (!rsp || rsp.err !== 'ok') {
         renderError(rsp || { err: 'request_failed' });
         return;
       }
+      mountProgress(token, row);
       setRunning(true);
       renderProgress({ progress: 0, stage: 'prepare' });
       startPolling();
@@ -464,7 +505,7 @@
         } else {
           dom.openBook.hidden = true;
         }
-        dom.done.hidden = false;
+        showDone();
         notify(i18n.t('doneMsg', { title: state.doneTitle }), 'success');
         loadAccounts();
       } else {
@@ -745,6 +786,13 @@
       notify(i18n.t('cancelSent'), 'info');
     }).catch(function () { /* 下一次轮询会反映状态 */ });
   });
+  dom.doneClose.addEventListener('click', hideDone);
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) {
+      hideDone();
+    }
+  });
+  window.addEventListener('pageshow', hideDone);
   dom.accountsToggle.addEventListener('click', function () {
     dom.accountsPanel.hidden = !dom.accountsPanel.hidden;
   });
@@ -765,7 +813,7 @@
     }
     var item = button.closest('.result-item');
     if (item) {
-      onDownload(item.getAttribute('data-book-token'));
+      onDownload(item.getAttribute('data-book-token'), item);
     }
   });
 
@@ -805,12 +853,12 @@
       return;
     }
     var status = rsp.data.status || 'idle';
+    // 只恢复进行中的任务；completed/failed/cancelled 是上一次会话的残留，
+    // 重新进入工具时不再回放 doneMsg / 旧错误。
     if (status === 'running' || status === 'starting') {
       setRunning(true);
       renderProgress(rsp.data);
       startPolling();
-    } else if (status === 'completed' || status === 'failed' || status === 'cancelled') {
-      handleProgress(rsp);
     }
   }).catch(function () { /* 宿主未登录等场景静默 */ });
 })();

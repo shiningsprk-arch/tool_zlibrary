@@ -50,6 +50,7 @@
   "cancelSent": "已請求取消",
   "openBook": "開啟書目",
   "doneMsg": "已入庫：{title}",
+  "doneClose": "關閉",
   "stagePrepare": "準備中",
   "stageDownloading": "下載中",
   "stageImporting": "入庫中",
