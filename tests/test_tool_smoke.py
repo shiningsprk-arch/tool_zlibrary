@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 
@@ -115,6 +117,8 @@ class FakeAPI(object):
         self.messages = self
         self.completed = []
         self.msgs = []
+        self.created = 0
+        self.progress_updates = []
 
     def get_work_dir(self, unique_key=None):
         path = os.path.join(self._root, unique_key or "root")
@@ -131,10 +135,11 @@ class FakeAPI(object):
         self._config = json.loads(json.dumps(data))
 
     def create_task(self, progress_data=None):
-        return 1
+        self.created += 1
+        return self.created
 
     def update_progress(self, task_id, progress, progress_data=None):
-        pass
+        self.progress_updates.append((task_id, progress, progress_data))
 
     def complete_task(self, task_id, error_message=None):
         self.completed.append(error_message)
@@ -148,8 +153,14 @@ class FakeClient(object):
         self.profile_calls = 0
         self.prepared = []
         self.stream_error = None
+        self.profile_error = None
         self.cancel_on_stream = False
         self.written = b"PK\x03\x04fake-epub"
+        self.barrier = None
+        self.on_stream = None
+        self.parallel = 0
+        self.max_parallel = 0
+        self.parallel_lock = threading.Lock()
 
     def origin(self):
         return "https://origin.example"
@@ -173,6 +184,8 @@ class FakeClient(object):
 
     def eapi_profile(self, origin, account, timeout=None):
         self.profile_calls += 1
+        if self.profile_error is not None:
+            raise self.profile_error
         return {"quota_today": 0, "quota_limit": 10, "remaining": 10,
                 "email": account.get("email", ""), "premium": False}
 
@@ -186,7 +199,7 @@ class FakeClient(object):
         raise zlib_client.ZlibError("accounts.login_failed", "bad")
 
     def prepare_download(self, origin, book, account=None, timeout=None):
-        self.prepared.append((book.get("id"), bool(account)))
+        self.prepared.append((book.get("id"), (account or {}).get("id")))
         return {"url": "https://cdn.example/book.epub"}
 
     def stream_download(self, target, dest, *, max_bytes, cancel_event=None,
@@ -196,8 +209,20 @@ class FakeClient(object):
         if self.cancel_on_stream:
             cancel_event.set()
             return 0
-        with open(dest, "wb") as f:
-            f.write(self.written)
+        callback, self.on_stream = self.on_stream, None
+        if callback is not None:
+            callback()
+        with self.parallel_lock:
+            self.parallel += 1
+            self.max_parallel = max(self.max_parallel, self.parallel)
+        try:
+            if self.barrier is not None:
+                self.barrier.wait(timeout=5)
+            with open(dest, "wb") as f:
+                f.write(self.written)
+        finally:
+            with self.parallel_lock:
+                self.parallel -= 1
         if progress_cb is not None:
             progress_cb(len(self.written), len(self.written))
         return len(self.written)
@@ -216,9 +241,9 @@ class SmokeBase(unittest.TestCase):
         self.tool.add_msg = lambda user_id, status, msg: self.api.msgs.append(
             (status, msg))
         self.tool.get_client = lambda config=None: self.client
-        ZlibraryTool._state = {}
+        ZlibraryTool._jobs = {}
+        ZlibraryTool._cancel_events = {}
         ZlibraryTool._search_cache = {}
-        ZlibraryTool._cancel_event = None
         ZlibraryTool._client = None
         ZlibraryTool._client_key = None
 
@@ -232,6 +257,10 @@ class SmokeBase(unittest.TestCase):
         with ZlibraryTool._search_lock:
             ZlibraryTool._search_cache[token] = (books[0], 10 ** 12)
         return token
+
+    def start_job(self, token, job_id="job1", title="Test Book"):
+        self.assertTrue(ZlibraryTool._begin(job_id, token, title))
+        return job_id
 
 
 class ConfigSmoke(SmokeBase):
@@ -293,9 +322,10 @@ class DownloadSmoke(SmokeBase):
                                    remix_userkey="key-abcdef")
         self.api._config = {"accounts": [account], "tag": "Z-Library",
                             "guest_enabled": False}
+        job_id = self.start_job(token)
         work_dir = self.tool.new_work_dir(3600)[1]
-        self.tool.run_download(7, work_dir, token)
-        snap = ZlibraryTool.snapshot()
+        self.tool.run_download(7, work_dir, token, job_id)
+        snap = ZlibraryTool.snapshot(job_id)
         self.assertEqual(snap["status"], "completed")
         self.assertEqual(snap["book_id"], 1)
         self.assertEqual(self.calibre.imported[0][1], "Test Book")
@@ -305,13 +335,28 @@ class DownloadSmoke(SmokeBase):
         self.assertEqual(self.api.completed, [None])
         self.assertFalse(os.path.exists(work_dir))
 
+    def test_task_progress_reaches_host(self):
+        token = self.add_book()
+        self.api._config = {"guest_enabled": True}
+        job_id = self.start_job(token)
+        work_dir = self.tool.new_work_dir(3600)[1]
+        self.tool.run_download(7, work_dir, token, job_id)
+        updates = self.api.progress_updates
+        self.assertTrue(all(task_id == 1 for task_id, _p, _d in updates))
+        percents = [percent for _task, percent, _data in updates]
+        self.assertIn(3, percents)
+        self.assertIn(96, percents)
+        self.assertIn(100, percents)
+        self.assertEqual(updates[-1][2].get("stage"), "done")
+
     def test_cancel_mid_download(self):
         token = self.add_book()
         self.api._config = {"guest_enabled": True}
         self.client.cancel_on_stream = True
+        job_id = self.start_job(token)
         work_dir = self.tool.new_work_dir(3600)[1]
-        self.tool.run_download(7, work_dir, token)
-        snap = ZlibraryTool.snapshot()
+        self.tool.run_download(7, work_dir, token, job_id)
+        snap = ZlibraryTool.snapshot(job_id)
         self.assertEqual(snap["status"], "cancelled")
         self.assertEqual(self.calibre.imported, [])
         self.assertEqual(self.api.completed, ["已取消"])
@@ -320,13 +365,172 @@ class DownloadSmoke(SmokeBase):
         token = self.add_book()
         self.api._config = {"guest_enabled": True}
         self.client.stream_error = zlib_client.ZlibError("download.too_large", "boom")
+        job_id = self.start_job(token)
         work_dir = self.tool.new_work_dir(3600)[1]
-        self.tool.run_download(7, work_dir, token)
-        snap = ZlibraryTool.snapshot()
+        self.tool.run_download(7, work_dir, token, job_id)
+        snap = ZlibraryTool.snapshot(job_id)
         self.assertEqual(snap["status"], "failed")
         self.assertEqual(snap["error"], "download.too_large")
         self.assertIn("danger", [m[0] for m in self.api.msgs])
         self.assertFalse(os.path.exists(work_dir))
+
+    def test_concurrent_jobs_do_not_overwrite_each_other(self):
+        token = self.add_book()
+        self.api._config = {"guest_enabled": True}
+        job_ids = []
+        for index in range(3):
+            job_id = self.start_job(token, "job%d" % index, "Book %d" % index)
+            job_ids.append(job_id)
+        self.assertEqual(ZlibraryTool.active_count(), 3)
+        self.assertEqual(len(ZlibraryTool.snapshot_jobs()), 3)
+        for job_id in job_ids[:2]:
+            work_dir = self.tool.new_work_dir(3600)[1]
+            self.tool.run_download(7, work_dir, token, job_id)
+            self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "completed")
+        self.assertEqual(ZlibraryTool.snapshot(job_ids[0])["book_id"], 1)
+        self.assertEqual(ZlibraryTool.snapshot(job_ids[1])["book_id"], 2)
+        self.assertEqual(ZlibraryTool.snapshot(job_ids[2])["status"], "starting")
+        self.assertEqual(ZlibraryTool.active_count(), 1)
+
+    def test_concurrent_limit_rejects_extra_jobs(self):
+        token = self.add_book()
+        for index in range(4):
+            self.start_job(token, "limit%d" % index)
+        self.assertFalse(ZlibraryTool._begin("limit4", token, "too many"))
+        self.assertEqual(ZlibraryTool.active_count(), 4)
+
+    def test_account_added_during_download_is_preserved(self):
+        token = self.add_book()
+        account = pool.new_account("A", remix_userid="1001",
+                                   remix_userkey="key-abcdef")
+        self.api._config = {"accounts": [account], "guest_enabled": False}
+
+        def add_second_account():
+            self.tool.account_action({
+                "action": "add", "mode": "cookie", "label": "B",
+                "remix_userid": "2002", "remix_userkey": "cookie-key-xyz",
+            })
+
+        self.client.on_stream = add_second_account
+        job_id = self.start_job(token)
+        work_dir = self.tool.new_work_dir(3600)[1]
+        self.tool.run_download(7, work_dir, token, job_id)
+        self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "completed")
+        labels = [item["label"] for item in self.api._config["accounts"]]
+        self.assertEqual(labels, ["A", "B"])
+
+    def test_account_deleted_during_download_is_not_resurrected(self):
+        token = self.add_book()
+        account = pool.new_account("A", remix_userid="1001",
+                                   remix_userkey="key-abcdef")
+        self.api._config = {"accounts": [account], "guest_enabled": False}
+
+        def delete_account():
+            self.tool.account_action({"action": "delete",
+                                      "id": account["id"]})
+
+        self.client.on_stream = delete_account
+        job_id = self.start_job(token)
+        work_dir = self.tool.new_work_dir(3600)[1]
+        self.tool.run_download(7, work_dir, token, job_id)
+        self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "completed")
+        self.assertEqual(self.api._config["accounts"], [])
+
+    def test_invalid_profile_status_is_persisted(self):
+        token = self.add_book()
+        account = pool.new_account("A", remix_userid="1001",
+                                   remix_userkey="key-abcdef")
+        self.api._config = {"accounts": [account], "guest_enabled": True}
+        self.client.profile_error = zlib_client.ZlibError(
+            "accounts.session_expired", "expired")
+        job_id = self.start_job(token)
+        work_dir = self.tool.new_work_dir(3600)[1]
+        self.tool.run_download(7, work_dir, token, job_id)
+        self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "completed")
+        stored = self.api._config["accounts"][0]
+        self.assertEqual(stored["status"], pool.STATUS_INVALID)
+
+    def test_thread_start_failure_fails_job_and_cleans_workdir(self):
+        token = self.add_book()
+        self.api._config = {"guest_enabled": True}
+        job_id = self.start_job(token)
+        work_dir = self.tool.new_work_dir(3600)[1]
+
+        class BrokenThread(object):
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("cannot start thread")
+
+        service_cls = tool_mod.AsyncService
+        service_cls.async_mode = staticmethod(lambda: True)
+        original_thread = threading.Thread
+        threading.Thread = BrokenThread
+        try:
+            self.tool.run_download(7, work_dir, token, job_id)
+        finally:
+            threading.Thread = original_thread
+            del service_cls.async_mode
+        self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "failed")
+        self.assertFalse(os.path.exists(work_dir))
+
+    def test_concurrent_jobs_pick_different_accounts(self):
+        token = self.add_book()
+        first = pool.new_account("A", remix_userid="1001",
+                                 remix_userkey="key-a")
+        second = pool.new_account("B", remix_userid="2002",
+                                  remix_userkey="key-b")
+        self.api._config = {"accounts": [first, second], "guest_enabled": False}
+        job_ids = [self.start_job(token, "acc%d" % index) for index in range(2)]
+        self.client.barrier = threading.Barrier(2)
+        service_cls = tool_mod.AsyncService
+        service_cls.async_mode = staticmethod(lambda: True)
+        try:
+            for job_id in job_ids:
+                work_dir = self.tool.new_work_dir(3600)[1]
+                self.tool.run_download(7, work_dir, token, job_id)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                statuses = [ZlibraryTool.snapshot(job_id)["status"]
+                            for job_id in job_ids]
+                if all(status in ("completed", "failed", "cancelled")
+                       for status in statuses):
+                    break
+                time.sleep(0.02)
+        finally:
+            del service_cls.async_mode
+        used = {account_id for _book, account_id in self.client.prepared}
+        self.assertEqual(used, {first["id"], second["id"]})
+        self.assertEqual([ZlibraryTool.snapshot(job_id)["status"]
+                          for job_id in job_ids],
+                         ["completed", "completed"])
+
+    def test_downloads_run_in_parallel_threads(self):
+        token = self.add_book()
+        self.api._config = {"guest_enabled": True}
+        job_ids = [self.start_job(token, "par%d" % index) for index in range(2)]
+        self.client.barrier = threading.Barrier(2)
+        service_cls = tool_mod.AsyncService
+        service_cls.async_mode = staticmethod(lambda: True)
+        try:
+            for job_id in job_ids:
+                work_dir = self.tool.new_work_dir(3600)[1]
+                self.tool.run_download(7, work_dir, token, job_id)
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                statuses = [ZlibraryTool.snapshot(job_id)["status"]
+                            for job_id in job_ids]
+                if all(status in ("completed", "failed", "cancelled")
+                       for status in statuses):
+                    break
+                time.sleep(0.02)
+        finally:
+            del service_cls.async_mode
+        self.assertEqual(self.client.max_parallel, 2)
+        self.assertEqual([ZlibraryTool.snapshot(job_id)["status"]
+                          for job_id in job_ids],
+                         ["completed", "completed"])
 
 
 class AccountSmoke(SmokeBase):

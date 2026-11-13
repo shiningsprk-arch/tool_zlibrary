@@ -2,7 +2,7 @@
   "tool_id": "zlibrary",
   "name": "Z-Library 入库",
   "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-  "revision": "0.1.1",
+  "revision": "0.1.2",
   "author": "黏菌",
   "publish_date": "2026-11-08",
   "core_api_version": "1.3.0",

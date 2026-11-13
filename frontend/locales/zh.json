@@ -98,6 +98,7 @@
   "error.params.missing": "缺少参数",
   "error.params.invalid": "参数不合法",
   "error.task.running": "已有下载任务在进行中",
+  "error.task.limit": "同时下载任务已达上限（4 个）",
   "error.task.not_running": "当前没有进行中的下载任务",
   "error.task.failed": "下载任务失败",
   "error.task.cancelled": "下载已取消",

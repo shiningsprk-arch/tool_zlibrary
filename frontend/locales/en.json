@@ -98,6 +98,7 @@
   "error.params.missing": "Missing parameter",
   "error.params.invalid": "Invalid parameter",
   "error.task.running": "A download task is already running",
+  "error.task.limit": "Too many concurrent downloads (max 4)",
   "error.task.not_running": "No download task is running",
   "error.task.failed": "Download task failed",
   "error.task.cancelled": "Download cancelled",

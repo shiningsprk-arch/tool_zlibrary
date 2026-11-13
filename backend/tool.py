@@ -33,6 +33,9 @@ _WORK_TTL = 24 * 3600
 _SEARCH_TTL = 2 * 3600
 _MAX_SEARCH_CACHE = 600
 _MAX_ACCOUNTS = 20
+_MAX_CONCURRENT = 4
+_JOB_KEEP = 10 * 60
+_MAX_JOB_RECORDS = 40
 _ENTRY_DEFAULT = zlib_client.DEFAULT_ENTRY
 _CONFIG_KEYS = ("entry_url", "dns_mode", "timeout", "max_mb", "tag",
                 "guest_enabled", "rotation", "search_limit")
@@ -59,6 +62,12 @@ _ORDER_OPTIONS = [
     ("", "Most relevant"), ("newest", "Newest"), ("oldest", "Oldest"),
     ("largest", "Largest"), ("smallest", "Smallest"),
 ]
+# 下载期间会变化的账号字段；持久化时只按 id 合并这些字段，不能整份覆盖号池，
+# 否则会丢掉下载过程中新增/修改/删除的账号。
+_ACCOUNT_RUNTIME_FIELDS = (
+    "email", "status", "quota_today", "quota_limit", "quota_updated_at",
+    "last_used", "cooldown_until", "last_error",
+)
 
 
 def _result_row(name, status, reason="", detail="", book_id=None):
@@ -79,9 +88,11 @@ class ZlibraryTool(BaseTool):
 
     service_item_name = "Z-Library 下载入库"
 
-    _state = {}
-    _state_lock = threading.Lock()
-    _cancel_event = None
+    _jobs = {}
+    _jobs_lock = threading.RLock()
+    _cancel_events = {}
+    _account_lock = threading.RLock()
+    _import_lock = threading.Lock()
     _client = None
     _client_key = None
     _client_lock = threading.Lock()
@@ -94,7 +105,7 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.1.1",
+            "revision": "0.1.2",
             "author": "黏菌",
             "publish_date": "2026-11-08",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
@@ -132,6 +143,10 @@ class ZlibraryTool(BaseTool):
         return data
 
     def save_config(self, patch):
+        with self._account_lock:
+            return self._save_config(patch)
+
+    def _save_config(self, patch):
         config = self.load_config()
         for key in _CONFIG_KEYS:
             if key not in patch:
@@ -156,6 +171,10 @@ class ZlibraryTool(BaseTool):
         return self.public_config(config)
 
     def save_accounts(self, account_list):
+        with self._account_lock:
+            return self._save_accounts(account_list)
+
+    def _save_accounts(self, account_list):
         config = self.load_config()
         config["accounts"] = [pool.normalize_account(item)
                               for item in account_list if isinstance(item, dict)][:_MAX_ACCOUNTS]
@@ -167,6 +186,20 @@ class ZlibraryTool(BaseTool):
         stored.pop("filters", None)
         stored["accounts"] = [pool.normalize_account(item) for item in config["accounts"]]
         self.api.storage.set_config(stored)
+
+    def _persist_account_state(self, account):
+        """只把运行期字段合并回号池，避免下载任务的旧快照覆盖新账号。"""
+        with self._account_lock:
+            config = self.load_config()
+            fresh = pool.find_account(config["accounts"], account.get("id"))
+            if not fresh:
+                return
+            for key in _ACCOUNT_RUNTIME_FIELDS:
+                if key == "email" and not account.get(key):
+                    continue
+                if key in account:
+                    fresh[key] = account[key]
+            self._persist(config)
 
     # ------------------------------------------------------------- 客户端
 
@@ -288,37 +321,102 @@ class ZlibraryTool(BaseTool):
         except OSError as err:
             logging.warning("[ZlibraryTool] GC failed: %s", err)
 
-    # ------------------------------------------------------------- 状态快照
+    # ------------------------------------------------------------- 任务状态
+
+    @staticmethod
+    def _is_active(job):
+        return bool(job) and job.get("status") in ("starting", "running")
+
+    @classmethod
+    def _gc_jobs_locked(cls):
+        now = time.time()
+        expired = [job_id for job_id, job in cls._jobs.items()
+                   if not cls._is_active(job)
+                   and now - job.get("updated_at", 0) > _JOB_KEEP]
+        for job_id in expired:
+            cls._jobs.pop(job_id, None)
+            cls._cancel_events.pop(job_id, None)
+        if len(cls._jobs) <= _MAX_JOB_RECORDS:
+            return
+        ordered = sorted(cls._jobs.items(),
+                         key=lambda pair: pair[1].get("created_at", 0))
+        for job_id, job in ordered:
+            if len(cls._jobs) <= _MAX_JOB_RECORDS:
+                break
+            if not cls._is_active(job):
+                cls._jobs.pop(job_id, None)
+                cls._cancel_events.pop(job_id, None)
 
     @classmethod
     def is_running(cls):
-        with cls._state_lock:
-            return cls._state.get("status") in ("starting", "running")
+        with cls._jobs_lock:
+            return any(cls._is_active(job) for job in cls._jobs.values())
 
     @classmethod
-    def snapshot(cls):
-        with cls._state_lock:
-            snap = dict(cls._state)
+    def active_count(cls):
+        with cls._jobs_lock:
+            return len([job for job in cls._jobs.values() if cls._is_active(job)])
+
+    @classmethod
+    def snapshot(cls, job_id=None):
+        with cls._jobs_lock:
+            if job_id:
+                job = cls._jobs.get(job_id)
+                return dict(job) if job else {}
+            jobs = sorted(cls._jobs.values(),
+                          key=lambda job: job.get("created_at", 0))
+            if not jobs:
+                return {}
+            snap = dict(jobs[-1])
             snap["results"] = list(snap.get("results") or [])
             return snap
 
     @classmethod
-    def _update(cls, **fields):
-        with cls._state_lock:
-            cls._state.update(fields)
+    def snapshot_jobs(cls):
+        with cls._jobs_lock:
+            cls._gc_jobs_locked()
+            jobs = sorted(cls._jobs.values(),
+                          key=lambda job: job.get("created_at", 0))
+            return [dict(job) for job in jobs]
 
     @classmethod
-    def _begin(cls, token, title):
-        with cls._state_lock:
-            if cls._state.get("status") in ("starting", "running"):
+    def _update(cls, job_id, **fields):
+        with cls._jobs_lock:
+            job = cls._jobs.get(job_id)
+            if not job:
+                return
+            job.update(fields)
+            job["updated_at"] = time.time()
+
+    @classmethod
+    def _begin(cls, job_id, token, title):
+        with cls._jobs_lock:
+            cls._gc_jobs_locked()
+            active = [job for job in cls._jobs.values() if cls._is_active(job)]
+            if len(active) >= _MAX_CONCURRENT:
                 return False
-            cls._state = {
-                "token": token, "task_id": None, "status": "starting",
-                "progress": 0, "stage": "prepare", "current": title, "error": "",
-                "downloaded": 0, "total": None, "book_id": None, "results": [],
-                "account": "",
+            now = time.time()
+            cls._jobs[job_id] = {
+                "job_id": job_id, "book_token": token, "task_id": None,
+                "status": "starting", "progress": 0, "stage": "prepare",
+                "current": title or "", "error": "", "detail": "",
+                "downloaded": 0, "total": None, "book_id": None,
+                "results": [], "account": "",
+                "created_at": now, "updated_at": now,
             }
+            cls._cancel_events[job_id] = threading.Event()
             return True
+
+    @classmethod
+    def _discard(cls, job_id):
+        with cls._jobs_lock:
+            cls._jobs.pop(job_id, None)
+            cls._cancel_events.pop(job_id, None)
+
+    @classmethod
+    def _cancel_event(cls, job_id):
+        with cls._jobs_lock:
+            return cls._cancel_events.get(job_id)
 
     # ------------------------------------------------------------- 账号操作
 
@@ -342,6 +440,10 @@ class ZlibraryTool(BaseTool):
         return True
 
     def account_action(self, body):
+        with self._account_lock:
+            return self._account_action(body)
+
+    def _account_action(self, body):
         action = str(body.get("action") or "").strip()
         config = self.load_config()
         client = self.get_client(config)
@@ -436,7 +538,15 @@ class ZlibraryTool(BaseTool):
     # ------------------------------------------------------------- 下载任务
 
     def _pick_download(self, client, origin, book, config, account_id=None):
-        account_list = config["accounts"]
+        # 账号额度/会话是按账号共享的资源，并发任务必须串行挑账号；
+        # 真正的文件流在锁外并行。
+        with self._account_lock:
+            return self._pick_download_locked(
+                client, origin, book, config, account_id=account_id)
+
+    def _pick_download_locked(self, client, origin, book, config, account_id=None):
+        # 必须用锁内重新读取的号池，调用方在下载开始时拿到的 config 可能已经过期。
+        account_list = self.load_config()["accounts"]
         chosen = []
         if account_id:
             account = pool.find_account(account_list, account_id)
@@ -456,9 +566,14 @@ class ZlibraryTool(BaseTool):
             if not account.get("enabled"):
                 continue
             try:
+                # 先占用 last_used，让并发的下一个任务挑到别的号；否则所有任务
+                # 都会在下载完成前选中同一个“最久未用”账号。
+                account["last_used"] = time.time()
+                self._persist_account_state(account)
                 if not self._profile_account(client, origin, account, config):
+                    self._persist_account_state(account)
                     continue
-                self.save_accounts(account_list)
+                self._persist_account_state(account)
                 target = client.prepare_download(
                     origin, book, account=account,
                     timeout=min(config["timeout"], 60))
@@ -467,7 +582,7 @@ class ZlibraryTool(BaseTool):
                 if err.code in ("accounts.session_expired", "accounts.login_failed",
                                 "download.limit"):
                     pool.mark_error(account, err.code, err.message)
-                    self.save_accounts(account_list)
+                    self._persist_account_state(account)
                     last_error = err
                     continue
                 raise
@@ -480,15 +595,61 @@ class ZlibraryTool(BaseTool):
         raise ZlibError("accounts.exhausted", "no usable account and guest mode is off")
 
     @AsyncService.register_service
-    def run_download(self, user_id, work_dir, book_token, account_id=None):
-        task_id = None
-        cancel_event = threading.Event()
+    def run_download(self, user_id, work_dir, book_token, job_id, account_id=None):
+        """服务队列只负责派发；每个任务一条线程，避免单队列把下载串行化。"""
+        args = (user_id, work_dir, book_token, job_id, account_id)
         try:
-            task_id = self.api.tasks.create_task({"status": "running"})
-            with self._state_lock:
-                type(self)._cancel_event = cancel_event
-                self._state.update({"task_id": task_id, "status": "running",
-                                    "stage": "downloading"})
+            threaded = bool(AsyncService().async_mode())
+        except Exception:
+            threaded = False
+        if not threaded:
+            self._download_job(*args)
+            return
+        thread = threading.Thread(
+            target=self._job_thread, args=args, daemon=True,
+            name="zlibrary-download-%s" % job_id)
+        try:
+            thread.start()
+        except Exception as err:
+            logging.exception("[ZlibraryTool] failed to start download thread")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self._fail(job_id, None, user_id, "task.failed", str(err))
+
+    def _job_thread(self, user_id, work_dir, book_token, job_id, account_id=None):
+        scoped = getattr(self, "scoped_session", None)
+        try:
+            self._download_job(user_id, work_dir, book_token, job_id, account_id)
+        except BaseException as err:
+            logging.exception("[ZlibraryTool] download thread aborted")
+            snap = self.snapshot(job_id)
+            shutil.rmtree(work_dir, ignore_errors=True)
+            self._fail(job_id, snap.get("task_id"), user_id, "task.failed", str(err))
+        finally:
+            remove = getattr(scoped, "remove", None)
+            if callable(remove):
+                try:
+                    remove()
+                except Exception:
+                    pass
+
+    def _report_task(self, task_id, percent, data=None):
+        if task_id is None:
+            return
+        try:
+            self.api.tasks.update_progress(task_id, percent,
+                                           progress_data=data or {})
+        except Exception as err:
+            logging.warning("[ZlibraryTool] task progress update failed: %s", err)
+
+    def _download_job(self, user_id, work_dir, book_token, job_id,
+                      account_id=None):
+        task_id = None
+        cancel_event = self._cancel_event(job_id) or threading.Event()
+        try:
+            task_id = self.api.tasks.create_task({"stage": "prepare"})
+            self._update(job_id, task_id=task_id, status="running",
+                         stage="downloading", progress=3)
+            self._report_task(task_id, 3, {"stage": "downloading"})
             config = self.load_config()
             client = self.get_client(config)
             book = self.load_book(book_token)
@@ -503,61 +664,79 @@ class ZlibraryTool(BaseTool):
             filename = "%s.%s" % (
                 zlib_client.sanitize_filename(title, book.get("id") or "book"), ext)
             dest = os.path.join(work_dir, filename)
+            last_report = [0.0]
 
             def on_progress(written, total):
                 percent = 5 + int(88 * written / total) if total else 30
-                self._update(progress=min(percent, 93), downloaded=written, total=total)
+                percent = min(percent, 93)
+                self._update(job_id, progress=percent,
+                             downloaded=written, total=total)
+                now = time.time()
+                if now - last_report[0] >= 0.5 or percent >= 93:
+                    last_report[0] = now
+                    self._report_task(task_id, percent, {
+                        "stage": "downloading", "downloaded": written,
+                        "total": total})
 
-            self._update(stage="downloading", current=title,
+            self._update(job_id, stage="downloading", current=title,
                          account=(used_account or {}).get("label", "游客"))
             size = client.stream_download(
                 target, dest, max_bytes=config["max_mb"] * (1024 ** 2),
                 cancel_event=cancel_event, progress_cb=on_progress,
                 timeout=config["timeout"])
             if cancel_event.is_set():
-                self._finish_cancelled(task_id, user_id)
+                self._finish_cancelled(job_id, task_id, user_id)
                 return
-            self._update(stage="importing", progress=95, downloaded=size, total=size)
-            book_id = self.api.calibre.import_file(
-                user_id, dest, title, [author] if author else [],
-                delete_after_import=True)
-            self._apply_tag(book_id, config.get("tag", ""))
+            self._update(job_id, stage="importing", progress=96,
+                         downloaded=size, total=size)
+            self._report_task(task_id, 96, {"stage": "importing"})
+            with self._import_lock:
+                book_id = self.api.calibre.import_file(
+                    user_id, dest, title, [author] if author else [],
+                    delete_after_import=True)
+                self._apply_tag(book_id, config.get("tag", ""))
             if used_account is not None:
-                pool.mark_success(used_account)
-                try:
-                    self._profile_account(client, origin, used_account, config)
-                except Exception as err:
-                    logging.warning("[ZlibraryTool] quota refresh failed: %s", err)
-                self.save_accounts(config["accounts"])
+                with self._account_lock:
+                    pool.mark_success(used_account)
+                    try:
+                        self._profile_account(client, origin, used_account, config)
+                    except Exception as err:
+                        logging.warning(
+                            "[ZlibraryTool] quota refresh failed: %s", err)
+                    self._persist_account_state(used_account)
+            self._report_task(task_id, 100,
+                              {"stage": "done", "book_id": book_id})
             self.api.tasks.complete_task(task_id)
-            self._update(status="completed", progress=100, stage="done",
-                         book_id=book_id, current=title,
-                         results=[_result_row(filename, "imported", book_id=book_id)])
+            self._update(job_id, status="completed", progress=100,
+                         stage="done", book_id=book_id, current=title,
+                         account=(used_account or {}).get("label", "游客"),
+                         results=[_result_row(filename, "imported",
+                                              book_id=book_id)])
         except ZlibError as err:
             if err.code == "cancelled":
-                self._finish_cancelled(task_id, user_id)
+                self._finish_cancelled(job_id, task_id, user_id)
                 return
-            self._fail(task_id, user_id, err.code, err.message)
+            self._fail(job_id, task_id, user_id, err.code, err.message)
         except Exception as err:
             logging.exception("[ZlibraryTool] task crashed")
-            self._fail(task_id, user_id, "task.failed", str(err))
+            self._fail(job_id, task_id, user_id, "task.failed", str(err))
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
-            with self._state_lock:
-                type(self)._cancel_event = None
 
-    def _fail(self, task_id, user_id, code, detail):
+    def _fail(self, job_id, task_id, user_id, code, detail):
         if task_id is not None:
+            self._report_task(task_id, 100, {"stage": "failed"})
             self.api.tasks.complete_task(task_id, error_message=detail or code)
-        self._update(status="failed", error=code, detail=detail, stage="done",
-                     progress=100)
+        self._update(job_id, status="failed", error=code, detail=detail,
+                     stage="done", progress=100)
         self.add_msg(user_id, "danger", _("下载/入库失败：%s") % (detail or code))
 
-    def _finish_cancelled(self, task_id, user_id):
+    def _finish_cancelled(self, job_id, task_id, user_id):
         if task_id is not None:
+            self._report_task(task_id, 100, {"stage": "cancelled"})
             self.api.tasks.complete_task(task_id, error_message=_("已取消"))
-        self._update(status="cancelled", error="cancelled", stage="done",
-                     progress=100)
+        self._update(job_id, status="cancelled", error="cancelled",
+                     stage="done", progress=100)
         self.add_msg(user_id, "warning", _("下载已取消"))
 
     def _apply_tag(self, book_id, tag):
@@ -698,54 +877,66 @@ class DownloadHandler(BaseHandler):
         token = str(body.get("book_token") or "")
         account_id = str(body.get("account_id") or "").strip() or None
         tool = ZlibraryTool()
-        if tool.is_running():
-            return {"err": "task.running", "msg": _("已有下载任务在进行中")}
         try:
-            tool.load_book(token)
+            book = tool.load_book(token)
         except ZlibError as err:
             return {"err": err.code, "msg": err.message}
-        work_token, work_dir = tool.new_work_dir(_WORK_TTL)
+        tool._gc_old_work_dirs(_WORK_TTL)
+        job_id = uuid.uuid4().hex[:16]
+        work_dir = tool.api.storage.get_work_dir(job_id)
         os.makedirs(work_dir, exist_ok=True)
-        if not ZlibraryTool._begin(work_token, token):
+        if not ZlibraryTool._begin(job_id, token, book.get("title") or ""):
             shutil.rmtree(work_dir, ignore_errors=True)
-            return {"err": "task.running", "msg": _("已有下载任务在进行中")}
+            return {"err": "task.limit",
+                    "msg": _("同时下载任务已达上限（%d 个）") % _MAX_CONCURRENT}
         try:
-            tool.run_download(self.current_user.id, work_dir, token,
+            tool.run_download(self.current_user.id, work_dir, token, job_id,
                               account_id=account_id)
         except Exception:
-            with ZlibraryTool._state_lock:
-                ZlibraryTool._state = {}
+            ZlibraryTool._discard(job_id)
             shutil.rmtree(work_dir, ignore_errors=True)
             raise
-        return {"err": "ok", "msg": _("下载任务已启动")}
+        return {"err": "ok", "data": {"job_id": job_id},
+                "msg": _("下载任务已启动")}
 
 
 class ProgressHandler(BaseHandler):
     @js
     @is_admin
     def get(self):
-        snap = ZlibraryTool.snapshot()
-        status = snap.get("status") or "idle"
-        data = snap if snap else {"status": "idle"}
-        if status == "failed":
-            return {"err": "task.failed", "msg": snap.get("detail") or _("任务失败"),
-                    "data": data}
-        if status == "cancelled":
-            return {"err": "task.cancelled", "msg": _("已取消"), "data": data}
-        return {"err": "ok",
-                "msg": _("完成") if status == "completed" else "", "data": data}
+        jobs = ZlibraryTool.snapshot_jobs()
+        latest = jobs[-1] if jobs else {}
+        data = dict(latest)
+        data["jobs"] = jobs
+        data["active"] = len([job for job in jobs
+                              if job.get("status") in ("starting", "running")])
+        if not data["jobs"]:
+            data = {"status": "idle", "jobs": [], "active": 0}
+        return {"err": "ok", "msg": "", "data": data}
 
 
 class CancelHandler(BaseHandler):
     @js
     @is_admin
     def post(self):
-        tool = ZlibraryTool()
-        if not tool.is_running():
-            return {"err": "task.not_running", "msg": _("当前没有进行中的下载任务")}
-        with ZlibraryTool._state_lock:
-            event = ZlibraryTool._cancel_event
-        if event is None:
-            return {"err": "task.not_running", "msg": _("当前没有进行中的下载任务")}
-        event.set()
-        return {"err": "ok", "msg": _("已请求取消")}
+        body = _json_body(self)
+        job_id = str(body.get("job_id") or "").strip()
+        with ZlibraryTool._jobs_lock:
+            active = {
+                jid: event
+                for jid, event in ZlibraryTool._cancel_events.items()
+                if ZlibraryTool._is_active(ZlibraryTool._jobs.get(jid))
+            }
+            if job_id:
+                event = active.get(job_id)
+                if event is None:
+                    return {"err": "task.not_running",
+                            "msg": _("当前没有进行中的下载任务")}
+                event.set()
+                return {"err": "ok", "msg": _("已请求取消")}
+            if not active:
+                return {"err": "task.not_running",
+                        "msg": _("当前没有进行中的下载任务")}
+            for event in active.values():
+                event.set()
+            return {"err": "ok", "msg": _("已请求取消")}

@@ -43,10 +43,6 @@
     yeartoInput: el('yearto-input'),
     notice: el('notice'),
     error: el('error'),
-    progressArea: el('progress-area'),
-    progress: el('progress'),
-    progressText: el('progress-text'),
-    cancelBtn: el('cancel-btn'),
     done: el('done'),
     doneText: el('done-text'),
     doneClose: el('done-close'),
@@ -84,13 +80,29 @@
     q: '',
     page: 1,
     searching: false,
-    running: false,
+    jobs: {},
+    jobByToken: {},
     pollTimer: null,
-    lastProgress: null,
     lastError: null,
     doneTitle: '',
     doneTimer: null,
   };
+
+  function jobIsActive(job) {
+    return !!job && (job.status === 'running' || job.status === 'starting');
+  }
+
+  function activeJobForToken(token) {
+    var jobId = state.jobByToken[token];
+    var job = jobId ? state.jobs[jobId] : null;
+    return jobIsActive(job) ? job : null;
+  }
+
+  function anyJobActive() {
+    return Object.keys(state.jobs).some(function (jobId) {
+      return jobIsActive(state.jobs[jobId]);
+    });
+  }
 
   // ------------------------------------------------------------------ 基础
 
@@ -281,10 +293,6 @@
     if (!q || state.searching) {
       return;
     }
-    if (state.running) {
-      renderError({ err: 'task.running' });
-      return;
-    }
     state.doneTitle = '';
     hideDone();
     state.q = q;
@@ -381,25 +389,61 @@
     button.textContent = i18n.t('downloadBtn');
     actions.appendChild(button);
     wrap.appendChild(actions);
+
+    var job = state.jobs[state.jobByToken[item.book_token]];
+    if (jobIsActive(job)) {
+      button.disabled = true;
+    }
+    if (job) {
+      wrap.appendChild(job.node || createJobProgress(job));
+      renderJob(job);
+    }
     return wrap;
   }
 
   // ------------------------------------------------------------------ 下载
 
-  function mountProgress(bookToken, row) {
-    row = row || dom.resultList.querySelector(
-      '.result-item[data-book-token="' + bookToken + '"]');
+  function findResultRow(token) {
+    if (!token) {
+      return null;
+    }
+    return dom.resultList.querySelector(
+      '.result-item[data-book-token="' + token + '"]');
+  }
+
+  function createJobProgress(job) {
+    var node = document.createElement('div');
+    node.className = 'row-progress';
+    node.setAttribute('data-job-id', job.job_id);
+    var barWrap = document.createElement('div');
+    barWrap.className = 'mb-progress-linear mb-progress-linear--indeterminate';
+    var bar = document.createElement('div');
+    bar.className = 'mb-progress-linear__bar';
+    barWrap.appendChild(bar);
+    var text = document.createElement('p');
+    text.className = 'hint';
+    var cancel = document.createElement('button');
+    cancel.className = 'mb-btn mb-btn--secondary small-btn';
+    cancel.type = 'button';
+    cancel.textContent = i18n.t('cancelBtn');
+    cancel.addEventListener('click', function () {
+      cancelJob(job.job_id);
+    });
+    node.appendChild(barWrap);
+    node.appendChild(text);
+    node.appendChild(cancel);
+    job.node = node;
+    job.parts = { barWrap: barWrap, bar: bar, text: text, cancel: cancel };
+    return node;
+  }
+
+  function mountProgress(job, row) {
+    row = row || findResultRow(job.book_token);
     if (!row) {
       return;
     }
-    var holder = row.querySelector('.row-progress');
-    if (!holder) {
-      holder = document.createElement('div');
-      holder.className = 'row-progress';
-      row.appendChild(holder);
-    }
-    holder.appendChild(dom.progressArea);
-    dom.progressArea.hidden = false;
+    row.appendChild(job.node || createJobProgress(job));
+    renderJob(job);
   }
 
   function hideDone() {
@@ -418,29 +462,6 @@
     state.doneTimer = setTimeout(hideDone, 8000);
   }
 
-  function onDownload(token, row) {
-    if (state.running) {
-      renderError({ err: 'task.running' });
-      return;
-    }
-    renderError(null);
-    state.doneTitle = '';
-    hideDone();
-    dom.openBook.hidden = true;
-    postJson('download', { book_token: token }).then(function (rsp) {
-      if (!rsp || rsp.err !== 'ok') {
-        renderError(rsp || { err: 'request_failed' });
-        return;
-      }
-      mountProgress(token, row);
-      setRunning(true);
-      renderProgress({ progress: 0, stage: 'prepare' });
-      startPolling();
-    }).catch(function (err) {
-      renderError({ err: 'request_failed', msg: String((err && err.message) || err) });
-    });
-  }
-
   function fmtBytes(n) {
     if (typeof n !== 'number' || n <= 0) {
       return '';
@@ -454,29 +475,207 @@
     return Math.round(n / 1024) + ' KB';
   }
 
-  function renderProgress(data) {
-    var percent = typeof data.progress === 'number' ? data.progress : 0;
+  function renderJob(job) {
+    if (!job || !job.parts) {
+      return;
+    }
+    var parts = job.parts;
+    var active = jobIsActive(job);
+    var percent = typeof job.progress === 'number' ? job.progress : 0;
+    percent = Math.max(0, Math.min(100, Math.round(percent)));
+    if (!active && (job.status === 'failed' || job.status === 'cancelled')) {
+      parts.barWrap.classList.remove('mb-progress-linear--indeterminate');
+      parts.bar.style.width = '100%';
+      parts.text.className = 'hint job-error';
+      parts.text.textContent = errorText({
+        err: job.error || (job.status === 'cancelled' ? 'cancelled' : 'task.failed'),
+        msg: job.detail || '',
+      });
+      parts.cancel.hidden = true;
+      return;
+    }
+    if (!active && job.status === 'completed') {
+      percent = 100;
+    }
     var stageKey = {
       prepare: 'stagePrepare', downloading: 'stageDownloading',
       importing: 'stageImporting', done: 'stageDone',
-    }[data.stage] || 'stagePrepare';
+    }[job.stage] || 'stagePrepare';
     var extra = '';
-    if (data.stage === 'downloading' && data.downloaded) {
-      extra = ' (' + fmtBytes(data.downloaded) +
-        (data.total ? ' / ' + fmtBytes(data.total) : '') + ')';
+    if (job.stage === 'downloading' && job.downloaded) {
+      extra = ' (' + fmtBytes(job.downloaded) +
+        (job.total ? ' / ' + fmtBytes(job.total) : '') + ')';
     }
-    dom.progressText.textContent = i18n.t('progressText', {
+    parts.text.className = 'hint';
+    parts.text.textContent = i18n.t('progressText', {
       percent: percent,
       stage: i18n.t(stageKey),
       extra: extra,
-      account: data.account ? ' · ' + data.account : '',
+      account: job.account ? ' · ' + job.account : '',
+    });
+    parts.cancel.hidden = !active;
+    parts.cancel.textContent = i18n.t('cancelBtn');
+    if (active && (job.stage === 'prepare' || !percent)) {
+      parts.barWrap.classList.add('mb-progress-linear--indeterminate');
+      parts.bar.style.width = '';
+    } else {
+      parts.barWrap.classList.remove('mb-progress-linear--indeterminate');
+      parts.bar.style.width = percent + '%';
+    }
+  }
+
+  function enableRowButton(token) {
+    var row = findResultRow(token);
+    var button = row && row.querySelector('button[data-action="download"]');
+    if (button) {
+      button.disabled = false;
+    }
+  }
+
+  function forgetTerminalJob(token) {
+    var jobId = state.jobByToken[token];
+    var job = jobId ? state.jobs[jobId] : null;
+    if (!job || jobIsActive(job)) {
+      return;
+    }
+    if (job.node && job.node.parentNode) {
+      job.node.parentNode.removeChild(job.node);
+    }
+    delete state.jobs[jobId];
+    delete state.jobByToken[token];
+  }
+
+  function handleTerminalJob(job, previousStatus) {
+    if (job.notified) {
+      return;
+    }
+    if (job.status !== 'completed' && job.status !== 'failed' &&
+        job.status !== 'cancelled') {
+      return;
+    }
+    if (previousStatus !== 'running' && previousStatus !== 'starting') {
+      return;
+    }
+    job.notified = true;
+    enableRowButton(job.book_token);
+    if (job.status === 'completed') {
+      renderError(null);
+      state.doneTitle = job.current || '';
+      updateDoneText();
+      if (job.book_id) {
+        dom.openBook.href = '/book/' + job.book_id;
+        dom.openBook.hidden = false;
+      } else {
+        dom.openBook.hidden = true;
+      }
+      showDone();
+      notify(i18n.t('doneMsg', { title: state.doneTitle }), 'success');
+      loadAccounts();
+      return;
+    }
+    var failure = {
+      err: job.error || (job.status === 'cancelled' ? 'cancelled' : 'task.failed'),
+      msg: job.detail || '',
+    };
+    renderError(failure);
+    notify(errorText(failure), job.status === 'cancelled' ? 'warning' : 'error');
+  }
+
+  function updateJob(raw) {
+    if (!raw || !raw.job_id) {
+      return;
+    }
+    var job = state.jobs[raw.job_id];
+    if (!job && !jobIsActive(raw)) {
+      // 后端会短暂保留已结束任务供多页签/重连查询；本页没跟踪过的旧任务
+      // 不再回放，也不要把已清理的旧进度节点重新挂回搜索结果。
+      return;
+    }
+    var previousStatus = job ? job.status : null;
+    if (!job) {
+      job = { job_id: raw.job_id, book_token: raw.book_token, node: null };
+      state.jobs[raw.job_id] = job;
+    }
+    Object.assign(job, raw);
+    job.job_id = raw.job_id;
+    job.book_token = raw.book_token || job.book_token;
+    if (job.book_token) {
+      state.jobByToken[job.book_token] = job.job_id;
+    }
+    var row = findResultRow(job.book_token);
+    if (row) {
+      mountProgress(job, row);
+      var button = row.querySelector('button[data-action="download"]');
+      if (button) {
+        button.disabled = jobIsActive(job);
+      }
+    } else if (job.node) {
+      renderJob(job);
+    }
+    handleTerminalJob(job, previousStatus);
+  }
+
+  function onDownload(token, row, button) {
+    if (activeJobForToken(token)) {
+      return;
+    }
+    renderError(null);
+    state.doneTitle = '';
+    hideDone();
+    dom.openBook.hidden = true;
+    forgetTerminalJob(token);
+    if (button) {
+      button.disabled = true;
+    }
+    postJson('download', { book_token: token }).then(function (rsp) {
+      if (!rsp || rsp.err !== 'ok') {
+        if (button) {
+          button.disabled = false;
+        }
+        renderError(rsp || { err: 'request_failed' });
+        return;
+      }
+      var titleEl = row && row.querySelector('.result-title');
+      var jobId = (rsp.data && rsp.data.job_id) || token;
+      var job = state.jobs[jobId];
+      if (!job) {
+        job = {
+          job_id: jobId,
+          book_token: token,
+          status: 'starting',
+          stage: 'prepare',
+          progress: 0,
+          current: titleEl ? titleEl.textContent : '',
+        };
+        state.jobs[jobId] = job;
+      } else {
+        // progress 轮询可能先于 download 响应看到这个任务并已挂好进度节点；
+        // 这里只能合并，不能整对象替换，否则 node/parts 会丢。
+        job.book_token = token;
+        if (!job.current) {
+          job.current = titleEl ? titleEl.textContent : '';
+        }
+      }
+      state.jobByToken[token] = jobId;
+      mountProgress(job, row);
+      renderJob(job);
+      ensurePolling();
+    }).catch(function (err) {
+      if (button) {
+        button.disabled = false;
+      }
+      renderError({ err: 'request_failed', msg: String((err && err.message) || err) });
     });
   }
 
-  function setRunning(running) {
-    state.running = running;
-    dom.progressArea.hidden = !running;
-    dom.cancelBtn.hidden = !running;
+  function cancelJob(jobId) {
+    postJson('cancel', { job_id: jobId }).then(function (rsp) {
+      if (rsp && rsp.err !== 'ok') {
+        renderError(rsp);
+        return;
+      }
+      notify(i18n.t('cancelSent'), 'info');
+    }).catch(function () { /* 下一次轮询会反映状态 */ });
   }
 
   function updateDoneText() {
@@ -486,43 +685,34 @@
     dom.openBook.title = i18n.t('openBook');
   }
 
-  function handleProgress(rsp) {
+  function handleProgress(rsp, initial) {
     if (!rsp || !rsp.data) {
       return;
     }
-    var data = rsp.data;
-    var status = data.status || 'idle';
-    if (status !== 'running' && status !== 'starting') {
-      stopPolling();
-      setRunning(false);
-      if (status === 'completed') {
-        renderError(null);
-        state.doneTitle = data.current || '';
-        updateDoneText();
-        if (data.book_id) {
-          dom.openBook.href = '/book/' + data.book_id;
-          dom.openBook.hidden = false;
-        } else {
-          dom.openBook.hidden = true;
-        }
-        showDone();
-        notify(i18n.t('doneMsg', { title: state.doneTitle }), 'success');
-        loadAccounts();
-      } else {
-        renderError(rsp);
+    var jobs = rsp.data.jobs || [];
+    jobs.forEach(function (raw) {
+      if (initial && !jobIsActive(raw)) {
+        return;
       }
-      return;
+      updateJob(raw);
+    });
+    if (anyJobActive()) {
+      ensurePolling();
+    } else {
+      stopPolling();
     }
-    state.lastProgress = data;
-    renderProgress(data);
   }
 
   function pollOnce() {
-    api('progress').then(handleProgress).catch(function () { /* 瞬时错误不停表 */ });
+    api('progress').then(function (rsp) {
+      handleProgress(rsp, false);
+    }).catch(function () { /* 瞬时错误不停表 */ });
   }
 
-  function startPolling() {
-    stopPolling();
+  function ensurePolling() {
+    if (state.pollTimer) {
+      return;
+    }
     state.pollTimer = setInterval(pollOnce, POLL_MS);
     pollOnce();
   }
@@ -777,15 +967,6 @@
   dom.nextBtn.addEventListener('click', function () {
     doSearch(state.page + 1);
   });
-  dom.cancelBtn.addEventListener('click', function () {
-    postJson('cancel', {}).then(function (rsp) {
-      if (rsp && rsp.err !== 'ok') {
-        renderError(rsp);
-        return;
-      }
-      notify(i18n.t('cancelSent'), 'info');
-    }).catch(function () { /* 下一次轮询会反映状态 */ });
-  });
   dom.doneClose.addEventListener('click', hideDone);
   document.addEventListener('visibilitychange', function () {
     if (document.hidden) {
@@ -813,7 +994,7 @@
     }
     var item = button.closest('.result-item');
     if (item) {
-      onDownload(item.getAttribute('data-book-token'), item);
+      onDownload(item.getAttribute('data-book-token'), item, button);
     }
   });
 
@@ -834,9 +1015,9 @@
     if (state.results.length) {
       renderResults({ page: state.page });
     }
-    if (state.running && state.lastProgress) {
-      renderProgress(state.lastProgress);
-    }
+    Object.keys(state.jobs).forEach(function (jobId) {
+      renderJob(state.jobs[jobId]);
+    });
     if (state.lastError) {
       renderError(state.lastError);
     }
@@ -849,16 +1030,8 @@
   loadConfig();
   loadAccounts();
   api('progress').then(function (rsp) {
-    if (!rsp || !rsp.data) {
-      return;
-    }
-    var status = rsp.data.status || 'idle';
     // 只恢复进行中的任务；completed/failed/cancelled 是上一次会话的残留，
     // 重新进入工具时不再回放 doneMsg / 旧错误。
-    if (status === 'running' || status === 'starting') {
-      setRunning(true);
-      renderProgress(rsp.data);
-      startPolling();
-    }
+    handleProgress(rsp, true);
   }).catch(function () { /* 宿主未登录等场景静默 */ });
 })();

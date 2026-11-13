@@ -98,6 +98,7 @@
   "error.params.missing": "缺少參數",
   "error.params.invalid": "參數不合法",
   "error.task.running": "已有下載任務在進行中",
+  "error.task.limit": "同時下載任務已達上限（4 個）",
   "error.task.not_running": "目前沒有進行中的下載任務",
   "error.task.failed": "下載任務失敗",
   "error.task.cancelled": "下載已取消",

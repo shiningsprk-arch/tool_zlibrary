@@ -431,16 +431,20 @@ class ZlibClient(object):
     def __init__(self, entry_url=DEFAULT_ENTRY, dns_mode="auto", timeout=30):
         self.timeout = timeout
         self.doorway = DoorwaySession(entry_url, timeout, dns_mode)
-        self.download_session = requests.Session()
-        self.download_session.trust_env = False
-        self.download_session.headers.update({
-            "User-Agent": BROWSER_HEADERS["User-Agent"],
-            "Accept": "*/*",
-        })
-        self.download_session.mount("https://", DohHttpAdapter(self.doorway.resolver))
         self._eapi = None
         self._lock = threading.Lock()
         self._request_lock = self.doorway.session_lock
+
+    def _new_download_session(self):
+        """每个下载任务独立 Session，共享 Session 在并发 get 时并不线程安全。"""
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({
+            "User-Agent": BROWSER_HEADERS["User-Agent"],
+            "Accept": "*/*",
+        })
+        session.mount("https://", DohHttpAdapter(self.doorway.resolver))
+        return session
 
     def origin(self, force=False):
         return self.doorway.final(force=force)
@@ -766,16 +770,22 @@ class ZlibClient(object):
                         cancel_event=None, progress_cb=None, timeout=None):
         response = target.get("response") if isinstance(target, dict) else None
         url = target.get("url") if isinstance(target, dict) else target
+        session = None
         if response is None:
             _validate_url(url)
+            session = self._new_download_session()
             try:
-                response = self.download_session.get(
+                response = session.get(
                     url, stream=True, timeout=timeout or self.timeout)
             except requests.RequestException as err:
+                session.close()
                 zerr = _find_zlib_error(err)
                 if zerr is not None:
                     raise zerr
                 raise ZlibError("download.http", str(err))
+            except Exception:
+                session.close()
+                raise
         try:
             if response.status_code >= 400:
                 raise ZlibError("download.http", "HTTP %d" % response.status_code)
@@ -802,6 +812,8 @@ class ZlibClient(object):
             return written
         finally:
             response.close()
+            if session is not None:
+                session.close()
 
     def health(self):
         started = time.time()

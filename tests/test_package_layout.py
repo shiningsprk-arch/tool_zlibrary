@@ -90,7 +90,7 @@ class ManifestTest(unittest.TestCase):
     def test_tool_id_and_versions(self):
         self.assertRegex(self.manifest["tool_id"], TOOL_ID_RE)
         self.assertRegex(self.manifest["revision"], SEMVER_RE)
-        self.assertEqual(self.manifest["revision"], "0.1.1")
+        self.assertEqual(self.manifest["revision"], "0.1.2")
         self.assertRegex(self.manifest["core_api_version"], SEMVER_RE)
 
     def test_repo_url_is_absolute_https(self):
@@ -158,12 +158,26 @@ class PackageLayoutTest(unittest.TestCase):
         self.assertIn("@media (max-width: 640px)", html)
         self.assertIn(".row-progress", html)
         self.assertIn("overflow-wrap: anywhere", html)
+        self.assertIn("function createJobProgress", js)
         self.assertIn("function mountProgress", js)
-        self.assertIn("holder.appendChild(dom.progressArea)", js)
+        self.assertIn("data-job-id", js)
+        # 每个任务独立进度节点，不能再把单一 #progress-area 搬来搬去
+        self.assertNotIn("dom.progressArea", js)
         # 重新进入工具时只恢复进行中任务，不回放旧 done/error
         self.assertNotIn(
             "status === 'completed' || status === 'failed' || status === 'cancelled'",
             js)
+
+    def test_download_jobs_are_tracked_individually(self):
+        js = _read(os.path.join(ROOT, "frontend", "app.js"))
+        backend = _read(os.path.join(ROOT, "backend", "tool.py"))
+        self.assertIn("book_token", js)
+        self.assertIn("state.jobs", js)
+        self.assertIn("state.jobByToken", js)
+        self.assertIn("rsp.data.jobs", js)
+        self.assertIn("_MAX_CONCURRENT", backend)
+        self.assertIn("threading.Thread", backend)
+        self.assertIn("update_progress", backend)
 
     def test_default_account_mode_and_done_link(self):
         html = _read(os.path.join(ROOT, "frontend", "index.html"))
