@@ -88,4 +88,4 @@ python scripts/build.py          # 纯 Python 打包 + 产物形状校验 + sha2
 
 ## 许可证
 
-MIT（见 LICENSE）。
+AGPL-3.0（见 LICENSE）。
