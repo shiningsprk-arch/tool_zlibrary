@@ -51,6 +51,9 @@ CHALLENGE_MARKERS = ("checking your browser", "a0_0x2a54", "c_token=",
 CHALLENGE_MAX_ITERATIONS = 2_000_000
 FINAL_ORIGIN_TTL = 10 * 60
 _MAX_HOPS = 10
+_ENTRY_TIMEOUT_MAX = 15.0
+_ENTRY_RETRY_ATTEMPTS = 2
+_ENTRY_RETRY_DELAY = 0.4
 _CHUNK_SIZE = 64 * 1024
 _DOWNLOAD_EXTENSIONS = {"epub", "pdf", "mobi", "azw3", "fb2", "djvu", "cbz", "cbr", "txt"}
 _EBOOK_TYPES = ("application/epub+zip", "application/pdf", "application/x-mobipocket-ebook",
@@ -141,6 +144,14 @@ def _find_zlib_error(exc):
     return None
 
 
+def _is_entry_retryable(err):
+    """入口读超时/连接断开可换新连接重试；证书校验失败不重试。"""
+    if isinstance(err, requests.exceptions.SSLError):
+        return "certificate verify failed" not in str(err).lower()
+    return isinstance(err, (requests.Timeout, requests.ConnectionError,
+                            requests.exceptions.ChunkedEncodingError))
+
+
 def _safe_url(url):
     try:
         parts = urlsplit(url)
@@ -148,6 +159,15 @@ def _safe_url(url):
         return "%s://%s%s" % (parts.scheme, parts.netloc, path)
     except ValueError:
         return "<invalid url>"
+
+
+def _safe_error_text(value, limit=300):
+    """错误文本可能带完整 URL/query；输出日志和前端前剥掉 query。"""
+    text = str(value or "")
+    text = re.sub(r"https?://[^\s'\"]+",
+                  lambda match: _safe_url(match.group(0)), text)
+    text = re.sub(r"(/[^\s'\"]*)\?[^\s'\"]*", r"\1", text)
+    return text[:limit]
 
 
 def _origin(url):
@@ -438,15 +458,34 @@ class DoorwaySession(object):
         self.entry_url = _normalize_entry(entry_url)
         self.timeout = timeout
         self.resolver = DnsResolver(mode=dns_mode, timeout=timeout)
-        self.session = requests.Session()
-        self.session.trust_env = False
-        self.session.headers.update(BROWSER_HEADERS)
-        self.session.mount("https://", DohHttpAdapter(self.resolver))
+        self.session = self._new_session()
         self.final_origin = ""
         self.final_at = 0.0
         self.hops = []
         self._lock = threading.Lock()
         self.session_lock = threading.RLock()
+
+    def _new_session(self):
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update(BROWSER_HEADERS)
+        session.mount("https://", DohHttpAdapter(self.resolver))
+        return session
+
+    def _reset_session(self):
+        """入口超时后换一条全新连接，保留已解出的挑战 cookie。"""
+        old = self.session
+        cookies = old.cookies
+        try:
+            old.close()
+        except Exception:
+            pass
+        session = self._new_session()
+        try:
+            session.cookies.update(cookies)
+        except Exception:
+            pass
+        self.session = session
 
     def final(self, force=False):
         with self._lock:
@@ -467,15 +506,35 @@ class DoorwaySession(object):
             return True
 
     def _request(self, url):
-        try:
-            return self.session.get(url, allow_redirects=False, timeout=self.timeout)
-        except ZlibError:
-            raise
-        except requests.RequestException as err:
-            zerr = _find_zlib_error(err)
-            if zerr is not None:
-                raise zerr
-            raise ZlibError("entry.unreachable", str(err))
+        with self.session_lock:
+            timeout = min(self.timeout, _ENTRY_TIMEOUT_MAX)
+            for attempt in range(_ENTRY_RETRY_ATTEMPTS):
+                try:
+                    response = self.session.get(
+                        url, allow_redirects=False, timeout=timeout)
+                    if attempt:
+                        logging.info(
+                            "[zlib_client] entry request recovered after retry: %s",
+                            _safe_url(url))
+                    return response
+                except ZlibError:
+                    raise
+                except requests.RequestException as err:
+                    zerr = _find_zlib_error(err)
+                    if zerr is not None:
+                        raise zerr
+                    if (attempt + 1 < _ENTRY_RETRY_ATTEMPTS
+                            and _is_entry_retryable(err)):
+                        logging.warning(
+                            "[zlib_client] entry request retry %d/%d: %s: %s",
+                            attempt + 1, _ENTRY_RETRY_ATTEMPTS,
+                            _safe_url(url), _safe_error_text(err, 160))
+                        self._reset_session()
+                        time.sleep(_ENTRY_RETRY_DELAY)
+                        continue
+                    raise ZlibError(
+                        "entry.unreachable",
+                        "%s: %s" % (_safe_url(url), _safe_error_text(err)))
 
     def _resolve(self):
         url = self.entry_url
@@ -576,7 +635,7 @@ class ZlibClient(object):
             zerr = _find_zlib_error(err)
             if zerr is not None:
                 raise zerr
-            raise ZlibError("entry.unreachable", str(err))
+            raise ZlibError("entry.unreachable", _safe_error_text(err))
 
     def _request_challenge_aware(self, method, url, *, data=None, headers=None,
                                  cookies=None, timeout=None, max_attempts=4):
@@ -649,7 +708,7 @@ class ZlibClient(object):
                 if attempt == 0 and retryable:
                     logging.warning(
                         "[zlib_client] EAPI retry after %s: %s",
-                        err.code, str(err.message)[:200])
+                        err.code, _safe_error_text(err.message, 200))
                     self.doorway.invalidate(current_origin)
                     current_origin = self.origin()
                     continue
@@ -667,7 +726,10 @@ class ZlibClient(object):
         except ZlibError:
             result = False
         with self._lock:
-            self._eapi = result
+            current = self.doorway.final_origin
+            # 只有本次探测的域仍是当前域时才缓存失败；成功则总是缓存。
+            if result or (current and current == origin):
+                self._eapi = result
         return result
 
     def eapi_login(self, origin, email, password, timeout=None):
@@ -825,12 +887,21 @@ class ZlibClient(object):
         try:
             return self._prepare_download_once(origin, book, account, timeout)
         except ZlibError as err:
-            if err.code in ("entry.unreachable", "download.http"):
+            retryable = err.code == "entry.unreachable" or (
+                err.code == "download.http" and "HTTP 404" not in err.message)
+            if retryable:
                 logging.warning(
-                    "[zlib_client] download prepare retry after %s", err.code)
-                self.doorway.invalidate(origin)
+                    "[zlib_client] download prepare retry after %s: %s",
+                    err.code, _safe_error_text(err.message, 160))
+                # _prepare_download_once 内部的 EAPI 重试可能已经换过域；
+                # 按当前缓存域失效，再强制重新走入口，避免第二次仍打旧/坏域。
+                current = self.doorway.final_origin
+                if current:
+                    self.doorway.invalidate(current)
+                else:
+                    self.doorway.invalidate()
                 return self._prepare_download_once(
-                    self.origin(), book, account, timeout)
+                    self.origin(force=True), book, account, timeout)
             raise
 
     def _prepare_download_once(self, origin, book, account=None, timeout=None):
@@ -881,7 +952,7 @@ class ZlibClient(object):
                 zerr = _find_zlib_error(err)
                 if zerr is not None:
                     raise zerr
-                raise ZlibError("download.http", str(err))
+                raise ZlibError("download.http", _safe_error_text(err))
             if response.status_code in (403, 503) and _is_challenge(response):
                 _solve_challenge(self.doorway.session, response)
                 response.close()
@@ -927,7 +998,7 @@ class ZlibClient(object):
                 zerr = _find_zlib_error(err)
                 if zerr is not None:
                     raise zerr
-                raise ZlibError("download.http", str(err))
+                raise ZlibError("download.http", _safe_error_text(err))
             except Exception:
                 session.close()
                 raise

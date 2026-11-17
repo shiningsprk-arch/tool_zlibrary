@@ -90,7 +90,7 @@ class ManifestTest(unittest.TestCase):
     def test_tool_id_and_versions(self):
         self.assertRegex(self.manifest["tool_id"], TOOL_ID_RE)
         self.assertRegex(self.manifest["revision"], SEMVER_RE)
-        self.assertEqual(self.manifest["revision"], "0.2.0")
+        self.assertEqual(self.manifest["revision"], "0.2.1")
         self.assertRegex(self.manifest["core_api_version"], SEMVER_RE)
 
     def test_repo_url_is_absolute_https(self):

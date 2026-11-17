@@ -106,7 +106,7 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.2.0",
+            "revision": "0.2.1",
             "author": "黏菌",
             "publish_date": "2026-11-17",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",

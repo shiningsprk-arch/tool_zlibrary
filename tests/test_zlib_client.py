@@ -7,6 +7,8 @@ import time
 import unittest
 from unittest import mock
 
+import requests
+
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TESTS_DIR)
 sys.path.insert(0, os.path.join(ROOT, "backend"))
@@ -20,6 +22,13 @@ class FakeCookies(object):
 
     def set(self, name, value, domain=None, path=None):
         self.values[name] = value
+
+    def update(self, other):
+        if isinstance(other, FakeCookies):
+            self.values.update(other.values)
+        else:
+            for cookie in other:
+                self.values[cookie.name] = cookie.value
 
 
 class FakeSession(object):
@@ -179,9 +188,102 @@ class DnsTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "dns.private")
 
 
+class EntryRetryTest(unittest.TestCase):
+    class FakeSession(object):
+        def __init__(self, error=None, response=None):
+            self.error = error
+            self.response = response
+            self.calls = 0
+            self.closed = False
+            self.cookies = FakeCookies()
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return self.response
+
+        def close(self):
+            self.closed = True
+
+    def make_doorway(self):
+        doorway = zlib_client.DoorwaySession("https://zlib.ch/", 30, "auto")
+        return doorway
+
+    def test_entry_timeout_retries_with_new_session(self):
+        doorway = self.make_doorway()
+        first = self.FakeSession(error=requests.exceptions.ReadTimeout("stalled"))
+        second = self.FakeSession(response=mock.Mock(
+            status_code=200, url="https://zlib.ch/"))
+        doorway.session = first
+        with mock.patch.object(doorway, "_new_session", return_value=second), \
+                mock.patch.object(zlib_client, "_ENTRY_RETRY_DELAY", 0):
+            response = doorway._request("https://zlib.ch/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(first.calls, 1)
+        self.assertTrue(first.closed)
+        self.assertEqual(second.calls, 1)
+        self.assertIs(doorway.session, second)
+
+    def test_entry_retry_preserves_challenge_cookies(self):
+        doorway = self.make_doorway()
+        first = self.FakeSession(error=requests.exceptions.ReadTimeout("stalled"))
+        first.cookies.set("c_token", "solved")
+        second = self.FakeSession(response=mock.Mock(
+            status_code=200, url="https://zlib.ch/"))
+        doorway.session = first
+        with mock.patch.object(doorway, "_new_session", return_value=second), \
+                mock.patch.object(zlib_client, "_ENTRY_RETRY_DELAY", 0):
+            doorway._request("https://zlib.ch/")
+        self.assertEqual(second.cookies.values.get("c_token"), "solved")
+
+    def test_entry_retry_stops_after_limit(self):
+        doorway = self.make_doorway()
+        first = self.FakeSession(error=requests.exceptions.ReadTimeout("one"))
+        second = self.FakeSession(error=requests.exceptions.ReadTimeout("two"))
+        doorway.session = first
+        with mock.patch.object(doorway, "_new_session", return_value=second), \
+                mock.patch.object(zlib_client, "_ENTRY_RETRY_DELAY", 0):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                doorway._request("https://zlib.ch/")
+        self.assertEqual(ctx.exception.code, "entry.unreachable")
+        self.assertIn("zlib.ch", str(ctx.exception))
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
+
+    def test_entry_cert_error_is_not_retried(self):
+        doorway = self.make_doorway()
+        first = self.FakeSession(error=requests.exceptions.SSLError(
+            "certificate verify failed"))
+        second = self.FakeSession()
+        doorway.session = first
+        with mock.patch.object(doorway, "_new_session", return_value=second):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                doorway._request("https://zlib.ch/")
+        self.assertEqual(ctx.exception.code, "entry.unreachable")
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 0)
+
+
 class OriginRetryTest(unittest.TestCase):
     def make_client(self):
         return zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+
+    def test_safe_error_text_strips_query(self):
+        text = zlib_client._safe_error_text(
+            "GET https://x.example/a?token=abc failed at /dl/xyz?token=secret")
+        self.assertNotIn("token", text)
+        self.assertIn("https://x.example/a", text)
+        self.assertIn("/dl/xyz", text)
+
+    def test_probe_failure_not_cached_after_origin_switch(self):
+        client = self.make_client()
+        client.doorway.final_origin = "https://new.example"
+        with mock.patch.object(
+                client, "_eapi_json",
+                side_effect=zlib_client.ZlibError("entry.unreachable", "timed out")):
+            self.assertFalse(client.probe_eapi("https://old.example"))
+        self.assertIsNone(client._eapi)
 
     def test_eapi_retries_once_with_new_origin(self):
         client = self.make_client()
@@ -225,6 +327,7 @@ class OriginRetryTest(unittest.TestCase):
 
     def test_download_prepare_retries_after_http_error(self):
         client = self.make_client()
+        client.doorway.final_origin = "https://old.example"
         calls = []
 
         def fake_once(origin, book, account=None, timeout=None):
@@ -242,6 +345,39 @@ class OriginRetryTest(unittest.TestCase):
         self.assertEqual(target["url"], "https://cdn.example/book.epub")
         self.assertEqual(calls, ["https://old.example", "https://new.example"])
         invalidate.assert_called_once_with("https://old.example")
+
+    def test_prepare_retry_invalidates_actual_current_origin(self):
+        client = self.make_client()
+        client.doorway.final_origin = "https://mid.example"
+        calls = []
+
+        def fake_once(origin, book, account=None, timeout=None):
+            calls.append(origin)
+            if len(calls) == 1:
+                raise zlib_client.ZlibError("entry.unreachable", "Read timed out")
+            return {"url": "https://cdn.example/book.epub"}
+
+        with mock.patch.object(client, "_prepare_download_once", fake_once), \
+                mock.patch.object(client, "origin",
+                                  return_value="https://new.example"), \
+                mock.patch.object(client.doorway, "invalidate") as invalidate:
+            client.prepare_download("https://old.example", {"id": "1"})
+        invalidate.assert_called_once_with("https://mid.example")
+
+    def test_prepare_does_not_retry_404(self):
+        client = self.make_client()
+        calls = []
+
+        def fake_once(origin, book, account=None, timeout=None):
+            calls.append(origin)
+            raise zlib_client.ZlibError("download.http", "HTTP 404")
+
+        with mock.patch.object(client, "_prepare_download_once", fake_once), \
+                mock.patch.object(client.doorway, "invalidate") as invalidate:
+            with self.assertRaises(zlib_client.ZlibError):
+                client.prepare_download("https://old.example", {"id": "1"})
+        self.assertEqual(calls, ["https://old.example"])
+        invalidate.assert_not_called()
 
     def test_final_origin_invalidate_forces_reresolve(self):
         doorway = zlib_client.DoorwaySession("https://zlib.ch/", 5, "auto")
