@@ -47,6 +47,8 @@
     doneText: el('done-text'),
     doneClose: el('done-close'),
     openBook: el('open-book'),
+    activeJobs: el('active-jobs'),
+    activeJobList: el('active-job-list'),
     results: el('results'),
     resultList: el('result-list'),
     sourceNote: el('source-note'),
@@ -223,10 +225,19 @@
         return (index + 1) + '. ' + hop.status + ' ' + hop.url +
           (hop.challenge !== undefined ? ' [' + i18n.t('healthChallenge') + ']' : '');
       });
+      var dohLines = (data.doh_providers || []).map(function (item) {
+        var result = item.ok
+          ? Math.round((item.latency || 0) * 1000) + ' ms'
+          : (item.error || 'fail');
+        return item.provider + ': ' + result;
+      });
       dom.healthDetail.textContent = [
         i18n.t('healthEntry', { entry: data.entry || '' }),
         i18n.t('healthDns', { mode: data.dns_mode || '' }),
         i18n.t('healthLatency', { seconds: data.latency || 0 }),
+        dohLines.length
+          ? i18n.t('healthDoh') + '\n' + dohLines.join('\n')
+          : i18n.t('healthDohIdle'),
         i18n.t('healthHops') + '\n' + hops.join('\n'),
       ].join('\n');
       dom.healthPanel.hidden = false;
@@ -345,6 +356,16 @@
     dom.prevBtn.disabled = state.page <= 1;
     var totalPages = data && data.total_pages ? data.total_pages : 0;
     dom.nextBtn.disabled = totalPages ? state.page >= totalPages : !state.results.length;
+    // 搜索会清空旧结果行；活动任务若不在新结果里，把进度节点收回全局面板。
+    Object.keys(state.jobs).forEach(function (jobId) {
+      var job = state.jobs[jobId];
+      if (jobIsActive(job) && job.node &&
+          !dom.resultList.contains(job.node) &&
+          job.node.parentNode !== dom.activeJobList) {
+        dom.activeJobList.appendChild(job.node);
+      }
+    });
+    refreshActiveJobs();
   }
 
   function renderResultItem(item) {
@@ -415,6 +436,9 @@
     var node = document.createElement('div');
     node.className = 'row-progress';
     node.setAttribute('data-job-id', job.job_id);
+    var title = document.createElement('div');
+    title.className = 'job-title';
+    title.textContent = job.current || '';
     var barWrap = document.createElement('div');
     barWrap.className = 'mb-progress-linear mb-progress-linear--indeterminate';
     var bar = document.createElement('div');
@@ -429,21 +453,40 @@
     cancel.addEventListener('click', function () {
       cancelJob(job.job_id);
     });
+    node.appendChild(title);
     node.appendChild(barWrap);
     node.appendChild(text);
     node.appendChild(cancel);
     job.node = node;
-    job.parts = { barWrap: barWrap, bar: bar, text: text, cancel: cancel };
+    job.parts = { title: title, barWrap: barWrap, bar: bar, text: text,
+                  cancel: cancel };
     return node;
+  }
+
+  function refreshActiveJobs() {
+    if (!dom.activeJobs) {
+      return;
+    }
+    if (!anyJobActive()) {
+      dom.activeJobList.textContent = '';
+      dom.activeJobs.hidden = true;
+      return;
+    }
+    dom.activeJobs.hidden = !dom.activeJobList.children.length;
   }
 
   function mountProgress(job, row) {
     row = row || findResultRow(job.book_token);
-    if (!row) {
+    var node = job.node || createJobProgress(job);
+    if (row) {
+      row.appendChild(node);
+    } else if (jobIsActive(job)) {
+      dom.activeJobList.appendChild(node);
+    } else {
       return;
     }
-    row.appendChild(job.node || createJobProgress(job));
     renderJob(job);
+    refreshActiveJobs();
   }
 
   function hideDone() {
@@ -480,6 +523,9 @@
       return;
     }
     var parts = job.parts;
+    if (parts.title) {
+      parts.title.textContent = job.current || '';
+    }
     var active = jobIsActive(job);
     var percent = typeof job.progress === 'number' ? job.progress : 0;
     percent = Math.max(0, Math.min(100, Math.round(percent)));
@@ -571,6 +617,7 @@
       showDone();
       notify(i18n.t('doneMsg', { title: state.doneTitle }), 'success');
       loadAccounts();
+      dropOrphanProgress(job);
       return;
     }
     var failure = {
@@ -579,6 +626,15 @@
     };
     renderError(failure);
     notify(errorText(failure), job.status === 'cancelled' ? 'warning' : 'error');
+    dropOrphanProgress(job);
+  }
+
+  function dropOrphanProgress(job) {
+    if (job.node && job.node.parentNode === dom.activeJobList) {
+      dom.activeJobList.removeChild(job.node);
+      job.node = null;
+    }
+    refreshActiveJobs();
   }
 
   function updateJob(raw) {
@@ -609,10 +665,13 @@
       if (button) {
         button.disabled = jobIsActive(job);
       }
+    } else if (jobIsActive(job)) {
+      mountProgress(job, null);
     } else if (job.node) {
       renderJob(job);
     }
     handleTerminalJob(job, previousStatus);
+    refreshActiveJobs();
   }
 
   function onDownload(token, row, button) {
@@ -696,6 +755,7 @@
       }
       updateJob(raw);
     });
+    refreshActiveJobs();
     if (anyJobActive()) {
       ensurePolling();
     } else {
@@ -765,18 +825,22 @@
     } else {
       var table = document.createElement('table');
       table.className = 'account-table';
+      var thead = document.createElement('thead');
       var head = document.createElement('tr');
-      ['accountLabel', 'statusLabel', 'quotaLabel', 'lastUsedLabel', 'actionsLabel']
+      ['accountNameLabel', 'statusLabel', 'quotaLabel', 'lastUsedLabel', 'actionsLabel']
         .forEach(function (key) {
           var th = document.createElement('th');
           th.textContent = i18n.t(key);
           head.appendChild(th);
         });
-      table.appendChild(head);
+      thead.appendChild(head);
+      table.appendChild(thead);
+      var tbody = document.createElement('tbody');
       state.accounts.forEach(function (account) {
         var row = document.createElement('tr');
         row.setAttribute('data-account-id', account.id);
         var name = document.createElement('td');
+        name.setAttribute('data-label', i18n.t('accountNameLabel'));
         var strong = document.createElement('div');
         strong.textContent = account.label || account.id;
         name.appendChild(strong);
@@ -788,6 +852,7 @@
         }
         row.appendChild(name);
         var status = document.createElement('td');
+        status.setAttribute('data-label', i18n.t('statusLabel'));
         var badge = document.createElement('span');
         badge.className = 'status-badge status-' + account.status;
         badge.textContent = accountStatusText(account);
@@ -800,19 +865,23 @@
         }
         row.appendChild(status);
         var quota = document.createElement('td');
+        quota.setAttribute('data-label', i18n.t('quotaLabel'));
         quota.textContent = quotaText(account);
         row.appendChild(quota);
         var last = document.createElement('td');
+        last.setAttribute('data-label', i18n.t('lastUsedLabel'));
         last.textContent = account.last_used ? formatTime(account.last_used) : '—';
         row.appendChild(last);
         var actions = document.createElement('td');
+        actions.setAttribute('data-label', i18n.t('actionsLabel'));
         actions.appendChild(accountButton('test', account.id, 'testBtn'));
         actions.appendChild(accountButton('toggle', account.id,
           account.enabled ? 'disableBtn' : 'enableBtn'));
         actions.appendChild(accountButton('delete', account.id, 'deleteBtn'));
         row.appendChild(actions);
-        table.appendChild(row);
+        tbody.appendChild(row);
       });
+      table.appendChild(tbody);
       dom.accountList.appendChild(table);
     }
     var usable = state.accounts.filter(function (account) {
@@ -907,17 +976,16 @@
     dom.accountNotice.textContent = i18n.t('accountAdding');
     postJson('accounts', body).then(function (rsp) {
       dom.addAccountBtn.disabled = false;
-      clearAccountInputs();
       if (!rsp || rsp.err !== 'ok') {
         dom.accountNotice.textContent = errorText(rsp || { err: 'request_failed' });
         return;
       }
+      clearAccountInputs();
       state.accounts = (rsp.data && rsp.data.accounts) || state.accounts;
       renderAccounts();
       dom.accountNotice.textContent = i18n.t('accountAdded');
     }).catch(function (err) {
       dom.addAccountBtn.disabled = false;
-      clearAccountInputs();
       dom.accountNotice.textContent = errorText({
         err: 'request_failed', msg: String((err && err.message) || err),
       });

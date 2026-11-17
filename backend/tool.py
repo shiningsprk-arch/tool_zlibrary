@@ -92,6 +92,7 @@ class ZlibraryTool(BaseTool):
     _jobs_lock = threading.RLock()
     _cancel_events = {}
     _account_lock = threading.RLock()
+    _persist_lock = threading.RLock()
     _import_lock = threading.Lock()
     _client = None
     _client_key = None
@@ -105,15 +106,19 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.1.2",
+            "revision": "0.2.0",
             "author": "黏菌",
-            "publish_date": "2026-11-08",
+            "publish_date": "2026-11-17",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
         }
 
     # ------------------------------------------------------------- 设置
 
     def load_config(self):
+        with self._persist_lock:
+            return self._load_config()
+
+    def _load_config(self):
         stored = self.api.storage.get_config() or {}
         config = dict(_DEFAULT_CONFIG)
         for key in _CONFIG_KEYS:
@@ -143,7 +148,7 @@ class ZlibraryTool(BaseTool):
         return data
 
     def save_config(self, patch):
-        with self._account_lock:
+        with self._persist_lock:
             return self._save_config(patch)
 
     def _save_config(self, patch):
@@ -171,7 +176,7 @@ class ZlibraryTool(BaseTool):
         return self.public_config(config)
 
     def save_accounts(self, account_list):
-        with self._account_lock:
+        with self._persist_lock:
             return self._save_accounts(account_list)
 
     def _save_accounts(self, account_list):
@@ -189,7 +194,7 @@ class ZlibraryTool(BaseTool):
 
     def _persist_account_state(self, account):
         """只把运行期字段合并回号池，避免下载任务的旧快照覆盖新账号。"""
-        with self._account_lock:
+        with self._persist_lock:
             config = self.load_config()
             fresh = pool.find_account(config["accounts"], account.get("id"))
             if not fresh:
@@ -278,12 +283,20 @@ class ZlibraryTool(BaseTool):
                     origin, q, page, config["search_limit"], filters,
                     timeout=min(config["timeout"], 60))
             else:
-                result = client.html_search(origin, q, page, timeout=min(config["timeout"], 60))
+                origin = client.origin()
+                result = client.html_search(
+                    origin, q, page, timeout=min(config["timeout"], 60))
         except ZlibError as err:
-            if err.code in ("eapi.http", "eapi.rejected") and client.probe_eapi(origin):
-                with client._lock:
-                    client._eapi = False
-                result = client.html_search(origin, q, page, timeout=min(config["timeout"], 60))
+            if err.code in ("eapi.http", "eapi.rejected"):
+                origin = client.origin()
+                if client.probe_eapi(origin):
+                    with client._lock:
+                        client._eapi = False
+                    origin = client.origin()
+                    result = client.html_search(
+                        origin, q, page, timeout=min(config["timeout"], 60))
+                else:
+                    raise
             else:
                 raise
         books = self._cache_books(result.get("books") or [])
@@ -293,7 +306,7 @@ class ZlibraryTool(BaseTool):
             "total_pages": result.get("total_pages") or 0,
             "total_items": result.get("total_items") or 0,
             "source": result.get("source") or "",
-            "origin": result.get("origin") or origin,
+            "origin": client.origin(),
         }
 
     # ------------------------------------------------------------- 工作目录
@@ -424,9 +437,11 @@ class ZlibraryTool(BaseTool):
         return client.origin()
 
     def _profile_account(self, client, origin, account, config):
+        # EAPI 请求可能刚因读超时换过最终域，调用方手里的 origin 可能已经过期。
+        origin = client.origin()
         try:
             profile = client.eapi_profile(origin, account,
-                                          timeout=min(config["timeout"], 45))
+                                          timeout=min(config["timeout"], 15))
         except ZlibError as err:
             if err.code in ("accounts.session_expired", "accounts.login_failed"):
                 pool.mark_error(account, err.code, err.message)
@@ -467,7 +482,7 @@ class ZlibraryTool(BaseTool):
                     if err.code not in ("accounts.login_failed", "eapi.http", "eapi.rejected"):
                         raise
                 if login is None:
-                    login = client.html_login(origin, email, password,
+                    login = client.html_login(client.origin(), email, password,
                                               timeout=min(config["timeout"], 45))
                 account = pool.new_account(label, email=email)
                 pool.merge_login(account, login)
@@ -575,7 +590,7 @@ class ZlibraryTool(BaseTool):
                     continue
                 self._persist_account_state(account)
                 target = client.prepare_download(
-                    origin, book, account=account,
+                    client.origin(), book, account=account,
                     timeout=min(config["timeout"], 60))
                 return target, account
             except ZlibError as err:
@@ -588,7 +603,8 @@ class ZlibraryTool(BaseTool):
                 raise
         if config.get("guest_enabled"):
             target = client.prepare_download(
-                origin, book, account=None, timeout=min(config["timeout"], 60))
+                client.origin(), book, account=None,
+                timeout=min(config["timeout"], 60))
             return target, None
         if last_error is not None:
             raise last_error
@@ -788,9 +804,13 @@ class ConfigHandler(BaseHandler):
 
     @js
     @is_admin
-    def post(self):
+    async def post(self):
+        body = _json_body(self)
         tool = ZlibraryTool()
-        return {"err": "ok", "data": tool.save_config(_json_body(self))}
+        loop = tornado.ioloop.IOLoop.current()
+        data = await loop.run_in_executor(
+            None, functools.partial(tool.save_config, body))
+        return {"err": "ok", "data": data}
 
 
 class HealthHandler(BaseHandler):

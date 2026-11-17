@@ -22,6 +22,7 @@ import ipaddress
 import json
 import logging
 import os
+import queue
 import re
 import socket
 import threading
@@ -115,6 +116,21 @@ def _ip_is_unspecified(value):
         return False
 
 
+def _parse_doh_answers(payload):
+    """从 AliDNS/Cloudflare/DNSPod 的 JSON DNS 响应里取公网 A 记录。"""
+    ips = []
+    answers = payload.get("Answer") if isinstance(payload, dict) else None
+    if not isinstance(answers, list):
+        return ips
+    for answer in answers:
+        if not isinstance(answer, dict) or answer.get("type") not in (1, None):
+            continue
+        value = _text(answer.get("data")).strip()
+        if value and value not in ips and _is_ip(value) and _ip_is_public(value):
+            ips.append(value)
+    return ips
+
+
 def _find_zlib_error(exc):
     seen = set()
     while exc is not None and id(exc) not in seen:
@@ -185,9 +201,15 @@ def _solve_challenge(session, response, max_iterations=CHALLENGE_MAX_ITERATIONS)
 class DnsResolver(object):
     """系统 DNS 优先；被污染/不可用时走 DoH。返回值 None 表示交给默认解析。"""
 
+    # 国内网络实测：AliDNS IP 直连和 DNSPod 最快，AliDNS 域名次之；
+    # Cloudflare 在当前网络会 reset，只作为最后兜底。
     DOH_PROVIDERS = (
-        "https://dns.alidns.com/resolve",
-        "https://cloudflare-dns.com/dns-query",
+        ("alidns-ip", "https://223.5.5.5/resolve", 4.0),
+        ("dnspod", "https://doh.pub/dns-query", 4.0),
+        ("alidns", "https://dns.alidns.com/resolve", 5.0),
+    )
+    DOH_OPTIONAL_PROVIDERS = (
+        ("cloudflare", "https://cloudflare-dns.com/dns-query", 3.0),
     )
 
     def __init__(self, mode="auto", timeout=25, cache_ttl=300):
@@ -196,11 +218,10 @@ class DnsResolver(object):
         self.cache_ttl = cache_ttl
         self._cache = {}
         self._lock = threading.Lock()
-        self._doh_lock = threading.Lock()
-        self._session = requests.Session()
-        self._session.trust_env = False
-        self._session.headers.update({"User-Agent": BROWSER_HEADERS["User-Agent"],
-                                      "Accept": "application/dns-json"})
+        self._host_locks = {}
+        self._host_locks_guard = threading.Lock()
+        self._report = []
+        self._report_lock = threading.Lock()
 
     def resolve(self, host):
         host = (host or "").strip().rstrip(".")
@@ -243,36 +264,113 @@ class DnsResolver(object):
         return result
 
     def _resolve_doh(self, host):
-        last_error = None
-        with self._doh_lock:
-            for provider in self.DOH_PROVIDERS:
-                try:
-                    resp = self._session.get(
-                        provider, params={"name": host, "type": "A"},
-                        headers={"Accept": "application/dns-json"},
-                        timeout=min(self.timeout, 8))
-                    if resp.status_code != 200:
-                        last_error = "HTTP %d" % resp.status_code
-                        continue
-                    payload = _json_payload(resp)
-                    answers = payload.get("Answer") or []
-                    ips = []
-                    if isinstance(answers, list):
-                        for answer in answers:
-                            if not isinstance(answer, dict) or answer.get("type") not in (1, None):
-                                continue
-                            value = _text(answer.get("data")).strip()
-                            if value and value not in ips:
-                                ips.append(value)
-                    good = [ip for ip in ips if _ip_is_public(ip)]
-                    if good:
-                        self._cache_set(host, good[0])
-                        return good[0]
-                    last_error = "no public A record"
-                except requests.RequestException as err:
-                    last_error = str(err)
-                    continue
-        raise ZlibError("dns.unreachable", host, last_error or "")
+        with self._host_lock(host):
+            cached = self._cache_get(host)
+            if cached is not None:
+                return cached or None
+            ips, errors = self._race_doh(host, self.DOH_PROVIDERS)
+            if not ips and self.DOH_OPTIONAL_PROVIDERS:
+                ips, extra = self._race_doh(host, self.DOH_OPTIONAL_PROVIDERS)
+                errors.extend(extra)
+            if ips:
+                self._cache_set(host, ips[0])
+                return ips[0]
+        if not errors:
+            errors.append("all DoH providers timed out")
+        raise ZlibError("dns.unreachable",
+                        "%s: %s" % (host, "; ".join(errors)))
+
+    def _host_lock(self, host):
+        with self._host_locks_guard:
+            lock = self._host_locks.get(host)
+            if lock is None:
+                lock = threading.Lock()
+                self._host_locks[host] = lock
+            return lock
+
+    def report(self):
+        with self._report_lock:
+            latest = {}
+            for item in self._report:
+                latest[item["provider"]] = dict(item)
+            return list(latest.values())
+
+    def _record_report(self, name, ok, latency, error=""):
+        with self._report_lock:
+            self._report.append({
+                "provider": name, "ok": bool(ok),
+                "latency": round(latency, 2), "error": (error or "")[:200],
+            })
+            if len(self._report) > 30:
+                self._report = self._report[-30:]
+
+    def _race_doh(self, host, providers):
+        """并发查所有 DoH 服务，第一个合法 A 记录胜出；总时长受最慢端点约束。"""
+        results = queue.Queue()
+        deadline = time.time() + max((item[2] for item in providers),
+                                     default=4.0) + 1.0
+        pending = len(providers)
+        errors = []
+        for provider in providers:
+            thread = threading.Thread(
+                target=self._doh_worker, args=(provider, host, results),
+                daemon=True, name="zlibrary-doh-%s" % provider[0])
+            try:
+                thread.start()
+            except Exception as err:
+                pending -= 1
+                message = "start failed: %s" % err
+                self._record_report(provider[0], False, 0.0, message)
+                errors.append("%s: %s" % (provider[0], message))
+        ips = []
+        while pending > 0:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                name, found, error, latency = results.get(timeout=remaining)
+            except queue.Empty:
+                break
+            pending -= 1
+            if found:
+                ips = found
+                break
+            if error:
+                errors.append("%s: %s" % (name, error))
+        return ips, errors
+
+    def _doh_worker(self, provider, host, results):
+        name, url, timeout = provider
+        started = time.time()
+        session = requests.Session()
+        session.trust_env = False
+        session.headers.update({"User-Agent": BROWSER_HEADERS["User-Agent"],
+                                "Accept": "application/dns-json"})
+        try:
+            response = session.get(
+                url, params={"name": host, "type": "A"},
+                headers={"Accept": "application/dns-json"},
+                timeout=(min(3.0, timeout), timeout))
+            if response.status_code != 200:
+                error = "HTTP %d" % response.status_code
+                self._record_report(name, False, time.time() - started, error)
+                results.put((name, [], error, time.time() - started))
+                return
+            ips = _parse_doh_answers(_json_payload(response))
+            latency = time.time() - started
+            self._record_report(name, bool(ips), latency,
+                                "" if ips else "no public A record")
+            if ips:
+                results.put((name, ips, "", latency))
+            else:
+                results.put((name, [], "no public A record", latency))
+        except Exception as err:
+            error = str(err)[:160]
+            latency = time.time() - started
+            self._record_report(name, False, latency, error)
+            results.put((name, [], error, latency))
+        finally:
+            session.close()
 
     def _cache_get(self, host):
         with self._lock:
@@ -356,6 +454,17 @@ class DoorwaySession(object):
                     and time.time() - self.final_at < FINAL_ORIGIN_TTL):
                 return self.final_origin
             return self._resolve()
+
+    def invalidate(self, expected_origin=None):
+        """最终域读超时/半失效时丢掉缓存；expected_origin 用于避免误清并发任务刚换好的域。"""
+        with self._lock:
+            if (expected_origin and self.final_origin
+                    and self.final_origin != expected_origin):
+                return False
+            self.final_origin = ""
+            self.final_at = 0.0
+            self.hops = []
+            return True
 
     def _request(self, url):
         try:
@@ -514,30 +623,52 @@ class ZlibClient(object):
 
     def _eapi_json(self, method, origin, path, *, data=None, account=None,
                    timeout=None):
-        response = self._request(
-            method, origin + path, data=data,
-            headers=self._eapi_headers(account, post=(method == "POST")),
-            cookies=self._account_cookies(account) if account else None,
-            timeout=timeout)
-        payload = _json_payload(response)
-        if not payload:
-            if response.status_code in (403, 503):
-                raise ZlibError("eapi.http", "HTTP %d" % response.status_code)
-            raise ZlibError("eapi.http", "invalid JSON (HTTP %d)" % response.status_code)
-        if payload.get("success") != 1:
-            raise _eapi_error(payload.get("error") or "EAPI rejected")
-        return payload
+        current_origin = origin
+        for attempt in range(2):
+            try:
+                response = self._request(
+                    method, current_origin + path, data=data,
+                    headers=self._eapi_headers(account, post=(method == "POST")),
+                    cookies=self._account_cookies(account) if account else None,
+                    timeout=timeout)
+                payload = _json_payload(response)
+                if not payload:
+                    if response.status_code in (403, 503):
+                        raise ZlibError("eapi.http",
+                                        "HTTP %d" % response.status_code)
+                    raise ZlibError(
+                        "eapi.http",
+                        "invalid JSON (HTTP %d)" % response.status_code)
+                if payload.get("success") != 1:
+                    raise _eapi_error(payload.get("error") or "EAPI rejected")
+                return payload
+            except ZlibError as err:
+                # 最终域可能半失效：读超时/连接异常/挑战页时换一个域再试一次。
+                retryable = err.code == "entry.unreachable" or (
+                    err.code == "eapi.http" and "HTTP 404" not in err.message)
+                if attempt == 0 and retryable:
+                    logging.warning(
+                        "[zlib_client] EAPI retry after %s: %s",
+                        err.code, str(err.message)[:200])
+                    self.doorway.invalidate(current_origin)
+                    current_origin = self.origin()
+                    continue
+                raise
 
     def probe_eapi(self, origin, force=False):
         with self._lock:
             if self._eapi is not None and not force:
                 return self._eapi
-            try:
-                self._eapi_json("GET", origin, "/eapi/info/domains", timeout=min(self.timeout, 20))
-                self._eapi = True
-            except ZlibError:
-                self._eapi = False
-            return self._eapi
+        # 不要在持有探测锁时跑网络/重试，否则一个慢最终域会阻塞其它搜索任务。
+        try:
+            self._eapi_json("GET", origin, "/eapi/info/domains",
+                            timeout=min(self.timeout, 20))
+            result = True
+        except ZlibError:
+            result = False
+        with self._lock:
+            self._eapi = result
+        return result
 
     def eapi_login(self, origin, email, password, timeout=None):
         payload = self._eapi_json(
@@ -691,6 +822,18 @@ class ZlibClient(object):
 
     def prepare_download(self, origin, book, account=None, timeout=None):
         """返回 {"url": ..., "response": optional_response}；URL 只在服务端。"""
+        try:
+            return self._prepare_download_once(origin, book, account, timeout)
+        except ZlibError as err:
+            if err.code in ("entry.unreachable", "download.http"):
+                logging.warning(
+                    "[zlib_client] download prepare retry after %s", err.code)
+                self.doorway.invalidate(origin)
+                return self._prepare_download_once(
+                    self.origin(), book, account, timeout)
+            raise
+
+    def _prepare_download_once(self, origin, book, account=None, timeout=None):
         if account and book.get("id") and book.get("hash"):
             try:
                 payload = self._eapi_json(
@@ -700,7 +843,8 @@ class ZlibClient(object):
                 link = (file_info.get("downloadLink") or payload.get("downloadLink")
                         or payload.get("url") or payload.get("link"))
                 if link:
-                    target = _absolutize(origin, _text(link))
+                    # _eapi_json 可能已经因读超时切换过最终域，按当前缓存域拼相对链接。
+                    target = _absolutize(self.origin(), _text(link))
                     _validate_url(target)
                     return {"url": target}
             except ZlibError as err:
@@ -708,8 +852,9 @@ class ZlibClient(object):
                     raise
                 # EAPI 文件端点不可用：继续走 HTML /dl/ 兜底
                 logging.info("[zlib_client] EAPI file unavailable: %s", err.code)
-        path = self._html_download_path(origin, book, timeout=timeout)
-        return self._prepare_html_download(origin, path, account=account, timeout=timeout)
+        path = self._html_download_path(self.origin(), book, timeout=timeout)
+        return self._prepare_html_download(
+            self.origin(), path, account=account, timeout=timeout)
 
     def _prepare_html_download(self, origin, path, account=None, timeout=None):
         url = urljoin(origin + "/", path.lstrip("/"))
@@ -824,6 +969,7 @@ class ZlibClient(object):
             "final_origin": origin,
             "eapi": bool(eapi),
             "dns_mode": self.doorway.resolver.mode,
+            "doh_providers": self.doorway.resolver.report(),
             "hops": list(self.doorway.hops),
             "latency": round(time.time() - started, 2),
         }

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -97,6 +98,64 @@ class ParseTest(unittest.TestCase):
 
 
 class DnsTest(unittest.TestCase):
+    def test_parse_doh_answers_filters_private_and_dupes(self):
+        payload = {"Answer": [
+            {"type": 1, "data": "104.21.30.30"},
+            {"type": 1, "data": "104.21.30.30"},
+            {"type": 1, "data": "127.0.0.1"},
+            {"type": 28, "data": "2606:4700::1"},
+        ]}
+        self.assertEqual(zlib_client._parse_doh_answers(payload),
+                         ["104.21.30.30"])
+
+    def test_doh_race_uses_fast_provider_and_caches(self):
+        resolver = zlib_client.DnsResolver(mode="doh")
+        providers = (("slow", "https://slow.test", 0.5),
+                     ("fast", "https://fast.test", 0.5))
+        calls = []
+
+        def fake_worker(provider, host, results):
+            calls.append(provider[0])
+            if provider[0] == "fast":
+                time.sleep(0.05)
+                resolver._record_report(provider[0], True, 0.05)
+                results.put((provider[0], ["104.21.30.30"], "", 0.05))
+            else:
+                time.sleep(0.35)
+                resolver._record_report(provider[0], False, 0.35, "timed out")
+                results.put((provider[0], [], "timed out", 0.35))
+
+        with mock.patch.object(resolver, "DOH_PROVIDERS", providers), \
+                mock.patch.object(resolver, "DOH_OPTIONAL_PROVIDERS", ()), \
+                mock.patch.object(resolver, "_doh_worker", fake_worker):
+            started = time.time()
+            self.assertEqual(resolver._resolve_doh("race.test"), "104.21.30.30")
+            self.assertLess(time.time() - started, 0.5)
+            self.assertEqual(resolver._cache_get("race.test"), "104.21.30.30")
+            first_calls = len(calls)
+            self.assertEqual(resolver._resolve_doh("race.test"), "104.21.30.30")
+            self.assertEqual(len(calls), first_calls)
+        report = resolver.report()
+        self.assertTrue(any(item["provider"] == "fast" and item["ok"]
+                            for item in report))
+
+    def test_doh_all_fail_reports_provider_errors(self):
+        resolver = zlib_client.DnsResolver(mode="doh")
+        providers = (("one", "https://one.test", 0.2),
+                     ("two", "https://two.test", 0.2))
+
+        def fake_worker(provider, host, results):
+            results.put((provider[0], [], "timeout", 0.1))
+
+        with mock.patch.object(resolver, "DOH_PROVIDERS", providers), \
+                mock.patch.object(resolver, "DOH_OPTIONAL_PROVIDERS", ()), \
+                mock.patch.object(resolver, "_doh_worker", fake_worker):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                resolver._resolve_doh("fail.test")
+        self.assertEqual(ctx.exception.code, "dns.unreachable")
+        self.assertIn("one: timeout", str(ctx.exception))
+        self.assertIn("two: timeout", str(ctx.exception))
+
     def test_doh_fallback_when_system_returns_unspecified(self):
         resolver = zlib_client.DnsResolver(mode="auto")
         with mock.patch("socket.getaddrinfo", return_value=[
@@ -118,6 +177,91 @@ class DnsTest(unittest.TestCase):
             with self.assertRaises(zlib_client.ZlibError) as ctx:
                 resolver.resolve("localhost.test")
         self.assertEqual(ctx.exception.code, "dns.private")
+
+
+class OriginRetryTest(unittest.TestCase):
+    def make_client(self):
+        return zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+
+    def test_eapi_retries_once_with_new_origin(self):
+        client = self.make_client()
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append(url)
+            if len(calls) == 1:
+                raise zlib_client.ZlibError("entry.unreachable", "Read timed out")
+            response = mock.Mock(status_code=200)
+            response.json.return_value = {"success": 1}
+            return response
+
+        with mock.patch.object(client, "_request", fake_request), \
+                mock.patch.object(client, "origin",
+                                  return_value="https://new.example") as origin, \
+                mock.patch.object(client.doorway, "invalidate") as invalidate:
+            data = client._eapi_json("GET", "https://old.example",
+                                     "/eapi/info/domains")
+        self.assertEqual(data["success"], 1)
+        invalidate.assert_called_once_with("https://old.example")
+        origin.assert_called_once_with()
+        self.assertTrue(calls[1].startswith("https://new.example"))
+
+    def test_eapi_retries_only_once(self):
+        client = self.make_client()
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append(url)
+            raise zlib_client.ZlibError("entry.unreachable", "Read timed out")
+
+        with mock.patch.object(client, "_request", fake_request), \
+                mock.patch.object(client, "origin",
+                                  return_value="https://new.example"), \
+                mock.patch.object(client.doorway, "invalidate") as invalidate:
+            with self.assertRaises(zlib_client.ZlibError):
+                client._eapi_json("GET", "https://old.example", "/eapi/info/domains")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(invalidate.call_count, 1)
+
+    def test_download_prepare_retries_after_http_error(self):
+        client = self.make_client()
+        calls = []
+
+        def fake_once(origin, book, account=None, timeout=None):
+            calls.append(origin)
+            if len(calls) == 1:
+                raise zlib_client.ZlibError("download.http", "HTTP 503")
+            return {"url": "https://cdn.example/book.epub"}
+
+        with mock.patch.object(client, "_prepare_download_once", fake_once), \
+                mock.patch.object(client, "origin",
+                                  return_value="https://new.example"), \
+                mock.patch.object(client.doorway, "invalidate") as invalidate:
+            target = client.prepare_download(
+                "https://old.example", {"id": "1"}, account=None)
+        self.assertEqual(target["url"], "https://cdn.example/book.epub")
+        self.assertEqual(calls, ["https://old.example", "https://new.example"])
+        invalidate.assert_called_once_with("https://old.example")
+
+    def test_final_origin_invalidate_forces_reresolve(self):
+        doorway = zlib_client.DoorwaySession("https://zlib.ch/", 5, "auto")
+        doorway.final_origin = "https://old.example"
+        doorway.final_at = time.time()
+        doorway.hops = [{"url": "https://old.example", "status": 200}]
+        doorway.invalidate()
+        self.assertEqual(doorway.final_origin, "")
+        self.assertEqual(doorway.hops, [])
+        with mock.patch.object(doorway, "_resolve",
+                               return_value="https://new.example") as resolve:
+            self.assertEqual(doorway.final(), "https://new.example")
+        resolve.assert_called_once_with()
+
+    def test_invalidate_does_not_clear_newer_origin(self):
+        doorway = zlib_client.DoorwaySession("https://zlib.ch/", 5, "auto")
+        doorway.final_origin = "https://new.example"
+        doorway.final_at = time.time()
+        self.assertFalse(doorway.invalidate("https://old.example"))
+        self.assertEqual(doorway.final_origin, "https://new.example")
 
     def test_private_literal_is_rejected(self):
         resolver = zlib_client.DnsResolver(mode="auto")

@@ -90,7 +90,7 @@ class ManifestTest(unittest.TestCase):
     def test_tool_id_and_versions(self):
         self.assertRegex(self.manifest["tool_id"], TOOL_ID_RE)
         self.assertRegex(self.manifest["revision"], SEMVER_RE)
-        self.assertEqual(self.manifest["revision"], "0.1.2")
+        self.assertEqual(self.manifest["revision"], "0.2.0")
         self.assertRegex(self.manifest["core_api_version"], SEMVER_RE)
 
     def test_repo_url_is_absolute_https(self):
@@ -179,6 +179,37 @@ class PackageLayoutTest(unittest.TestCase):
         self.assertIn("threading.Thread", backend)
         self.assertIn("update_progress", backend)
 
+    def test_mobile_account_table_card_layout(self):
+        html = _read(os.path.join(ROOT, "frontend", "index.html"))
+        js = _read(os.path.join(ROOT, "frontend", "app.js"))
+        self.assertIn(".account-table thead { display: none; }", html)
+        self.assertIn(".account-table td::before", html)
+        self.assertIn(".settings-grid .mb-row { flex-direction: column", html)
+        self.assertIn("flex: 1 1 160px", html)
+        self.assertIn("box-sizing: border-box", html)
+        self.assertIn("document.createElement('thead')", js)
+        self.assertIn("setAttribute('data-label'", js)
+
+    def test_active_job_panel_and_asset_version(self):
+        manifest = _read_json(os.path.join(ROOT, "manifest.json"))
+        html = _read(os.path.join(ROOT, "frontend", "index.html"))
+        js = _read(os.path.join(ROOT, "frontend", "app.js"))
+        self.assertIn("?v=%s" % manifest["revision"], html)
+        self.assertIn('id="active-jobs"', html)
+        self.assertIn("data-i18n=\"activeJobsHint\"", html)
+        self.assertIn("function refreshActiveJobs", js)
+        self.assertIn("dom.activeJobList.appendChild(node)", js)
+
+    def test_account_form_clears_only_after_success(self):
+        js = _read(os.path.join(ROOT, "frontend", "app.js"))
+        start = js.index("function addAccount()")
+        end = js.index("// ------------------------------------------------------------------ 错误",
+                       start)
+        body = js[start:end]
+        self.assertEqual(body.count("clearAccountInputs();"), 1)
+        self.assertLess(body.index("rsp.err !== 'ok'"),
+                        body.index("clearAccountInputs();"))
+
     def test_default_account_mode_and_done_link(self):
         html = _read(os.path.join(ROOT, "frontend", "index.html"))
         js = _read(os.path.join(ROOT, "frontend", "app.js"))
@@ -236,7 +267,8 @@ class BackendContractTest(unittest.TestCase):
     def test_remote_handlers_run_via_executor(self):
         for cls_name, fn in (("SearchHandler", "search_sync"),
                              ("AccountsHandler", "account_action"),
-                             ("HealthHandler", "health_sync")):
+                             ("HealthHandler", "health_sync"),
+                             ("ConfigHandler", "save_config")):
             segment = ast.get_source_segment(
                 self.tool_src, _method_node(_class_node(self.tree, cls_name), "post"
                                             if cls_name != "HealthHandler" else "get")) or ""
