@@ -158,6 +158,7 @@ class FakeClient(object):
         self.written = b"PK\x03\x04fake-epub"
         self.barrier = None
         self.on_stream = None
+        self.last_dest = None
         self.parallel = 0
         self.max_parallel = 0
         self.parallel_lock = threading.Lock()
@@ -212,6 +213,7 @@ class FakeClient(object):
         callback, self.on_stream = self.on_stream, None
         if callback is not None:
             callback()
+        self.last_dest = dest
         with self.parallel_lock:
             self.parallel += 1
             self.max_parallel = max(self.max_parallel, self.parallel)
@@ -348,6 +350,22 @@ class DownloadSmoke(SmokeBase):
         self.assertIn(96, percents)
         self.assertIn(100, percents)
         self.assertEqual(updates[-1][2].get("stage"), "done")
+
+    def test_long_title_download_keeps_metadata_but_short_filename(self):
+        token = self.add_book()
+        long_title = "中" * 1000
+        with ZlibraryTool._search_lock:
+            book, expires = ZlibraryTool._search_cache[token]
+            book = dict(book, title=long_title)
+            ZlibraryTool._search_cache[token] = (book, expires)
+        self.api._config = {"guest_enabled": True}
+        job_id = self.start_job(token, title=long_title)
+        work_dir = self.tool.new_work_dir(3600)[1]
+        self.tool.run_download(7, work_dir, token, job_id)
+        self.assertEqual(ZlibraryTool.snapshot(job_id)["status"], "completed")
+        self.assertEqual(self.calibre.imported[0][1], long_title)
+        filename = os.path.basename(self.client.last_dest)
+        self.assertLessEqual(len(filename.encode("utf-8")), 209)
 
     def test_cancel_mid_download(self):
         token = self.add_book()

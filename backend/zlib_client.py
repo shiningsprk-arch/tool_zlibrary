@@ -59,6 +59,7 @@ _DOWNLOAD_EXTENSIONS = {"epub", "pdf", "mobi", "azw3", "fb2", "djvu", "cbz", "cb
 _EBOOK_TYPES = ("application/epub+zip", "application/pdf", "application/x-mobipocket-ebook",
                 "application/vnd.amazon.ebook", "application/zip",
                 "application/octet-stream", "application/x-rar-compressed")
+_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]')
 
 
 class ZlibError(Exception):
@@ -1149,7 +1150,28 @@ def _html_total_pages(html, page):
     return max(max(pages), int(page or 1))
 
 
-def sanitize_filename(name, fallback):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name or "").strip()
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")[:120].strip()
-    return cleaned or fallback
+def _clip_utf8(text, max_bytes):
+    out = []
+    used = 0
+    for char in text:
+        try:
+            size = len(char.encode("utf-8"))
+        except UnicodeEncodeError:
+            continue
+        if used + size > max_bytes:
+            break
+        out.append(char)
+        used += size
+    return "".join(out)
+
+
+def sanitize_filename(name, fallback, max_bytes=200):
+    """清理文件名并按 UTF-8 字节截断（Linux NAME_MAX 通常为 255 字节）。"""
+    cleaned = _INVALID_FILENAME_RE.sub(" ", name or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    cleaned = _clip_utf8(cleaned, max_bytes).strip(" .")
+    if not cleaned:
+        fallback = _INVALID_FILENAME_RE.sub(" ", str(fallback or "")).strip()
+        fallback = re.sub(r"\s+", " ", fallback).strip(" .")
+        cleaned = _clip_utf8(fallback, max_bytes).strip(" .") or "book"
+    return cleaned

@@ -3,6 +3,7 @@
 import hashlib
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -98,6 +99,20 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(zlib_client.sanitize_filename('a/b:c*..', "x"),
                          "a b c")
         self.assertEqual(zlib_client.sanitize_filename("", "fallback"), "fallback")
+        self.assertEqual(zlib_client.sanitize_filename("", "a/b"), "a b")
+        long_cjk = "中" * 1000
+        clipped = zlib_client.sanitize_filename(long_cjk, "fallback")
+        self.assertLessEqual(len(clipped.encode("utf-8")), 200)
+        self.assertLessEqual(len((clipped + ".epub").encode("utf-8")), 209)
+        emoji = zlib_client.sanitize_filename("😀" * 1000, "fallback")
+        self.assertLessEqual(len(emoji.encode("utf-8")), 200)
+        self.assertEqual(zlib_client.sanitize_filename("", "x" * 1000),
+                         "x" * 200)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, clipped + ".epub")
+            with open(dest, "wb") as handle:
+                handle.write(b"PK")
+            self.assertTrue(os.path.exists(dest))
 
     def test_http_entry_is_upgraded_and_http_download_rejected(self):
         self.assertEqual(zlib_client._normalize_entry("http://zlib.ch"),
