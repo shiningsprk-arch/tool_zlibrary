@@ -27,7 +27,7 @@ import re
 import socket
 import threading
 import time
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -54,11 +54,19 @@ _MAX_HOPS = 10
 _ENTRY_TIMEOUT_MAX = 15.0
 _ENTRY_RETRY_ATTEMPTS = 2
 _ENTRY_RETRY_DELAY = 0.4
+# 入口链上的 5xx（尤其是 504）多为上游网关的瞬时超时：非挑战页时换连接重试，
+# 不把一次 504 直接当最终结果。挑战页（503 + 标记）仍交给 _resolve 解挑战。
+_ENTRY_HTTP_RETRY_STATUS = (502, 503, 504)
+_ENTRY_HTTP_RETRY_ATTEMPTS = 2
+_ENTRY_HTTP_RETRY_DELAY = 0.6
+# 入口主页 5xx 时 EAPI 往往仍然可用：用“只跟随跳转”的目标域做 EAPI 探测兜底。
+_EAPI_PROBE_TIMEOUT_MAX = 12.0
 _CHUNK_SIZE = 64 * 1024
 _DOWNLOAD_EXTENSIONS = {"epub", "pdf", "mobi", "azw3", "fb2", "djvu", "cbz", "cbr", "txt"}
 _EBOOK_TYPES = ("application/epub+zip", "application/pdf", "application/x-mobipocket-ebook",
                 "application/vnd.amazon.ebook", "application/zip",
                 "application/octet-stream", "application/x-rar-compressed")
+_INVALID_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\ud800-\udfff]')
 
 
 class ZlibError(Exception):
@@ -462,6 +470,9 @@ class DoorwaySession(object):
         self.final_origin = ""
         self.final_at = 0.0
         self.hops = []
+        self.tolerant_final = ""
+        self.tolerant_at = 0.0
+        self.tolerant_hops = []
         self._lock = threading.Lock()
         self.session_lock = threading.RLock()
 
@@ -503,20 +514,20 @@ class DoorwaySession(object):
             self.final_origin = ""
             self.final_at = 0.0
             self.hops = []
+            self.tolerant_final = ""
+            self.tolerant_at = 0.0
+            self.tolerant_hops = []
             return True
 
-    def _request(self, url):
+    def _request(self, url, retry_http=True):
         with self.session_lock:
             timeout = min(self.timeout, _ENTRY_TIMEOUT_MAX)
-            for attempt in range(_ENTRY_RETRY_ATTEMPTS):
+            attempt = 0
+            http_attempt = 0
+            while True:
                 try:
                     response = self.session.get(
                         url, allow_redirects=False, timeout=timeout)
-                    if attempt:
-                        logging.info(
-                            "[zlib_client] entry request recovered after retry: %s",
-                            _safe_url(url))
-                    return response
                 except ZlibError:
                     raise
                 except requests.RequestException as err:
@@ -529,17 +540,40 @@ class DoorwaySession(object):
                             "[zlib_client] entry request retry %d/%d: %s: %s",
                             attempt + 1, _ENTRY_RETRY_ATTEMPTS,
                             _safe_url(url), _safe_error_text(err, 160))
+                        attempt += 1
                         self._reset_session()
                         time.sleep(_ENTRY_RETRY_DELAY)
                         continue
                     raise ZlibError(
                         "entry.unreachable",
                         "%s: %s" % (_safe_url(url), _safe_error_text(err)))
+                if (retry_http
+                        and response.status_code in _ENTRY_HTTP_RETRY_STATUS
+                        and http_attempt < _ENTRY_HTTP_RETRY_ATTEMPTS
+                        and not _is_challenge(response)):
+                    http_attempt += 1
+                    logging.warning(
+                        "[zlib_client] entry request got HTTP %d, retry %d/%d: %s",
+                        response.status_code, http_attempt,
+                        _ENTRY_HTTP_RETRY_ATTEMPTS, _safe_url(url))
+                    response.close()
+                    self._reset_session()
+                    time.sleep(_ENTRY_HTTP_RETRY_DELAY * http_attempt)
+                    continue
+                if attempt or http_attempt:
+                    logging.info(
+                        "[zlib_client] entry request recovered after retry: %s",
+                        _safe_url(url))
+                return response
 
     def _resolve(self):
         url = self.entry_url
         hops = []
         challenge_attempts = 0
+        # 重新解析失败时不能留着上一次的最终域/跳转链，否则健康检查会误报。
+        self.final_origin = ""
+        self.final_at = 0.0
+        self.hops = []
         with self.session_lock:
             for _ in range(_MAX_HOPS):
                 resp = self._request(url)
@@ -577,6 +611,54 @@ class DoorwaySession(object):
                 return origin
         raise ZlibError("entry.too_many_redirects", "> %d" % _MAX_HOPS)
 
+    def tolerant_origin(self, force=False):
+        """只跟随跳转取最终域，不要求落地页 2xx，也不解挑战。
+
+        入口主页 5xx 时 EAPI 往往仍可用；这个域只用于 EAPI 兜底，不能当作
+        HTML/挑战可用的最终域。结果与 final_origin 分开缓存。
+        """
+        with self._lock:
+            if (not force and self.tolerant_final
+                    and time.time() - self.tolerant_at < FINAL_ORIGIN_TTL):
+                return self.tolerant_final
+            self.tolerant_final = ""
+            self.tolerant_at = 0.0
+            self.tolerant_hops = []
+            url = self.entry_url
+            hops = []
+            with self.session_lock:
+                for _ in range(_MAX_HOPS):
+                    resp = self._request(url, retry_http=False)
+                    hops.append({"url": _safe_url(resp.url),
+                                 "status": resp.status_code})
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            raise ZlibError(
+                                "entry.http", "redirect without Location")
+                        target = urljoin(resp.url, location)
+                        _validate_url(target)
+                        url = target
+                        continue
+                    origin = _origin(resp.url)
+                    _validate_url(origin + "/")
+                    self.tolerant_final = origin
+                    self.tolerant_at = time.time()
+                    self.tolerant_hops = hops
+                    return origin
+            raise ZlibError("entry.too_many_redirects", "> %d" % _MAX_HOPS)
+
+    def drop_tolerant(self, expected_origin=None):
+        """EAPI 探测失败时丢弃只跟随跳转的缓存，避免把坏目标复用 10 分钟。"""
+        with self._lock:
+            if (expected_origin and self.tolerant_final
+                    and self.tolerant_final != expected_origin):
+                return False
+            self.tolerant_final = ""
+            self.tolerant_at = 0.0
+            self.tolerant_hops = []
+            return True
+
 
 def _normalize_entry(value):
     value = (value or DEFAULT_ENTRY).strip()
@@ -600,8 +682,14 @@ class ZlibClient(object):
         self.timeout = timeout
         self.doorway = DoorwaySession(entry_url, timeout, dns_mode)
         self._eapi = None
+        self._eapi_origin = ""
         self._lock = threading.Lock()
         self._request_lock = self.doorway.session_lock
+        # 入口主页不可用时，origin() 会退回 EAPI 仍可用的重定向目标；同 TTL 缓存。
+        self._api_origin = ""
+        self._api_origin_at = 0.0
+        self._api_is_fallback = False
+        self._api_lock = threading.RLock()
 
     def _new_download_session(self):
         """每个下载任务独立 Session，共享 Session 在并发 get 时并不线程安全。"""
@@ -615,7 +703,98 @@ class ZlibClient(object):
         return session
 
     def origin(self, force=False):
-        return self.doorway.final(force=force)
+        with self._api_lock:
+            if (not force and self._api_origin
+                    and time.time() - self._api_origin_at < FINAL_ORIGIN_TTL):
+                return self._api_origin
+            return self._resolve_origin(force)
+
+    def _resolve_origin(self, force):
+        """入口优先；入口主页失败时退回“重定向目标 + EAPI 探测”的兜底域。"""
+        entry_error = None
+        try:
+            strict = self.doorway.final(force=force)
+        except ZlibError as err:
+            strict = ""
+            entry_error = err
+            logging.warning(
+                "[zlib_client] doorway unavailable (%s), trying EAPI fallback",
+                _safe_error_text(err.message, 160))
+        if strict:
+            self._set_api_origin(strict)
+            return strict
+        fallback = self._fallback_api_origin(force)
+        if fallback:
+            self._set_api_origin(fallback, fallback=True)
+            with self._lock:
+                # 刚用 /eapi/info/domains 探测过，直接标记 EAPI 可用。
+                self._eapi = True
+                self._eapi_origin = fallback
+            return fallback
+        raise entry_error or ZlibError(
+            "entry.unreachable", "no usable Z-Library origin")
+
+    def _set_api_origin(self, origin, fallback=False):
+        """记录当前 API 域；调用方必须持有 _api_lock。"""
+        if origin != self._api_origin:
+            with self._lock:
+                self._eapi = None
+                self._eapi_origin = ""
+        self._api_origin = origin
+        self._api_origin_at = time.time()
+        self._api_is_fallback = bool(fallback)
+
+    def invalidate_origin(self, expected_origin=None):
+        """入口/兜底域失效时清缓存；expected 防止误清并发任务刚换好的域。"""
+        with self._api_lock:
+            if (expected_origin and self._api_origin
+                    and self._api_origin != expected_origin):
+                return False
+            self._api_origin = ""
+            self._api_origin_at = 0.0
+            self._api_is_fallback = False
+        with self._lock:
+            self._eapi = None
+            self._eapi_origin = ""
+        return self.doorway.invalidate(expected_origin)
+
+    def _fallback_api_origin(self, force=False):
+        try:
+            tolerant = self.doorway.tolerant_origin(force=force)
+        except ZlibError as err:
+            logging.warning(
+                "[zlib_client] tolerant origin failed: %s",
+                _safe_error_text(err.message, 160))
+            return ""
+        if not tolerant:
+            return ""
+        if not self._probe_origin(tolerant):
+            self.doorway.drop_tolerant(tolerant)
+            return ""
+        logging.warning(
+            "[zlib_client] using fallback EAPI origin %s", _safe_url(tolerant))
+        return tolerant
+
+    def _probe_origin(self, origin):
+        """不走 _eapi_json 的重试/换域，避免在 origin() 解析过程中递归。"""
+        try:
+            response = self._request(
+                "GET", origin + "/eapi/info/domains",
+                headers={"Accept": "application/json"},
+                allow_redirects=False,
+                timeout=min(self.timeout, _EAPI_PROBE_TIMEOUT_MAX))
+            payload = _json_payload(response)
+            if response.status_code != 200:
+                raise ZlibError(
+                    "eapi.http", "HTTP %d" % response.status_code)
+            if not payload or payload.get("success") != 1:
+                raise ZlibError("eapi.http", "invalid JSON payload")
+        except ZlibError as err:
+            logging.info(
+                "[zlib_client] EAPI probe failed for %s: %s: %s",
+                _safe_url(origin), err.code, _safe_error_text(err.message, 120))
+            return False
+        return True
 
     # ---------------------------------------------------------------- 请求
 
@@ -709,14 +888,15 @@ class ZlibClient(object):
                     logging.warning(
                         "[zlib_client] EAPI retry after %s: %s",
                         err.code, _safe_error_text(err.message, 200))
-                    self.doorway.invalidate(current_origin)
+                    self.invalidate_origin(current_origin)
                     current_origin = self.origin()
                     continue
                 raise
 
     def probe_eapi(self, origin, force=False):
         with self._lock:
-            if self._eapi is not None and not force:
+            if (not force and self._eapi is not None
+                    and self._eapi_origin == origin):
                 return self._eapi
         # 不要在持有探测锁时跑网络/重试，否则一个慢最终域会阻塞其它搜索任务。
         try:
@@ -726,10 +906,11 @@ class ZlibClient(object):
         except ZlibError:
             result = False
         with self._lock:
-            current = self.doorway.final_origin
+            current = self._api_origin or self.doorway.final_origin
             # 只有本次探测的域仍是当前域时才缓存失败；成功则总是缓存。
             if result or (current and current == origin):
                 self._eapi = result
+                self._eapi_origin = origin
         return result
 
     def eapi_login(self, origin, email, password, timeout=None):
@@ -812,9 +993,26 @@ class ZlibClient(object):
 
     # ---------------------------------------------------------------- HTML
 
-    def html_search(self, origin, query, page, timeout=None):
-        params = {"page": str(max(1, int(page or 1)))}
+    def html_search(self, origin, query, page, filters=None, timeout=None):
+        filters = filters or {}
+        params = [("page", str(max(1, int(page or 1))))]
+        for language in filters.get("languages") or []:
+            if language:
+                params.append(("languages[]", str(language).lower()))
+        for extension in filters.get("extensions") or []:
+            if extension:
+                params.append(("extensions[]", str(extension).lower()))
+        if filters.get("year_from"):
+            params.append(("yearFrom", str(filters["year_from"])))
+        if filters.get("year_to"):
+            params.append(("yearTo", str(filters["year_to"])))
+        if filters.get("order"):
+            params.append(("order", str(filters["order"])))
+        if filters.get("exact"):
+            params.append(("e", "1"))
         url = origin + "/s/" + quote(query)
+        if params:
+            url += "?" + urlencode(params)
         response = self._request_challenge_aware("GET", url, timeout=timeout)
         if response.status_code >= 400:
             raise ZlibError("search.http", "HTTP %d" % response.status_code)
@@ -895,11 +1093,11 @@ class ZlibClient(object):
                     err.code, _safe_error_text(err.message, 160))
                 # _prepare_download_once 内部的 EAPI 重试可能已经换过域；
                 # 按当前缓存域失效，再强制重新走入口，避免第二次仍打旧/坏域。
-                current = self.doorway.final_origin
+                current = self._api_origin or self.doorway.final_origin
                 if current:
-                    self.doorway.invalidate(current)
+                    self.invalidate_origin(current)
                 else:
-                    self.doorway.invalidate()
+                    self.invalidate_origin()
                 return self._prepare_download_once(
                     self.origin(force=True), book, account, timeout)
             raise
@@ -1034,14 +1232,31 @@ class ZlibClient(object):
     def health(self):
         started = time.time()
         origin = self.origin(force=True)
-        eapi = self.probe_eapi(origin, force=True)
+        with self._api_lock:
+            fallback = bool(self._api_is_fallback
+                            and self._api_origin == origin)
+            hops = list(self.doorway.hops)
+            fallback_hops = list(self.doorway.tolerant_hops)
+        with self._lock:
+            cached = self._eapi if self._eapi_origin == origin else None
+        # 只有兜底路径刚探测过才复用；strict 的手动健康检查每次都真探测。
+        if fallback and cached is True:
+            eapi = True
+        else:
+            eapi = self._probe_origin(origin)
+            if eapi:
+                with self._lock:
+                    self._eapi = True
+                    self._eapi_origin = origin
         return {
             "entry": self.doorway.entry_url,
             "final_origin": origin,
+            "fallback": fallback,
             "eapi": bool(eapi),
             "dns_mode": self.doorway.resolver.mode,
             "doh_providers": self.doorway.resolver.report(),
-            "hops": list(self.doorway.hops),
+            "hops": hops,
+            "fallback_hops": fallback_hops,
             "latency": round(time.time() - started, 2),
         }
 
@@ -1149,7 +1364,28 @@ def _html_total_pages(html, page):
     return max(max(pages), int(page or 1))
 
 
-def sanitize_filename(name, fallback):
-    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", name or "").strip()
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")[:120].strip()
-    return cleaned or fallback
+def _clip_utf8(text, max_bytes):
+    out = []
+    used = 0
+    for char in text:
+        try:
+            size = len(char.encode("utf-8"))
+        except UnicodeEncodeError:
+            continue
+        if used + size > max_bytes:
+            break
+        out.append(char)
+        used += size
+    return "".join(out)
+
+
+def sanitize_filename(name, fallback, max_bytes=200):
+    """清理文件名并按 UTF-8 字节截断（Linux NAME_MAX 通常为 255 字节）。"""
+    cleaned = _INVALID_FILENAME_RE.sub(" ", name or "").strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    cleaned = _clip_utf8(cleaned, max_bytes).strip(" .")
+    if not cleaned:
+        fallback = _INVALID_FILENAME_RE.sub(" ", str(fallback or "")).strip()
+        fallback = re.sub(r"\s+", " ", fallback).strip(" .")
+        cleaned = _clip_utf8(fallback, max_bytes).strip(" .") or "book"
+    return cleaned

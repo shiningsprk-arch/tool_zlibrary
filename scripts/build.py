@@ -24,7 +24,7 @@ FORBIDDEN_PARTS = ("__pycache__", ".pyc", ".DS_Store", ".porting")
 REQUIRED_FILES = (
     "manifest.json", "icon.png",
     "backend/__init__.py", "backend/tool.py", "backend/zlib_client.py",
-    "backend/accounts.py",
+    "backend/accounts.py", "backend/credential_store.py",
     "frontend/index.html", "frontend/app.js",
     "frontend/lib/theme.css", "frontend/lib/i18n.js",
     "frontend/locales/zh.json", "frontend/locales/en.json",

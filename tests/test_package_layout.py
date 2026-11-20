@@ -90,7 +90,7 @@ class ManifestTest(unittest.TestCase):
     def test_tool_id_and_versions(self):
         self.assertRegex(self.manifest["tool_id"], TOOL_ID_RE)
         self.assertRegex(self.manifest["revision"], SEMVER_RE)
-        self.assertEqual(self.manifest["revision"], "0.2.1")
+        self.assertEqual(self.manifest["revision"], "0.3.0")
         self.assertRegex(self.manifest["core_api_version"], SEMVER_RE)
 
     def test_repo_url_is_absolute_https(self):
@@ -122,7 +122,8 @@ class ManifestTest(unittest.TestCase):
 class PackageLayoutTest(unittest.TestCase):
     def test_backend_package_and_entry_module(self):
         for rel in ("backend/__init__.py", "backend/tool.py",
-                    "backend/zlib_client.py", "backend/accounts.py"):
+                    "backend/zlib_client.py", "backend/accounts.py",
+                    "backend/credential_store.py"):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), rel)
 
     def test_frontend_entry_exists(self):
@@ -149,7 +150,7 @@ class PackageLayoutTest(unittest.TestCase):
 
     def test_required_runtime_files_exist(self):
         for rel in ("backend/tool.py", "backend/zlib_client.py", "backend/accounts.py",
-                    "LICENSE", "README.md"):
+                    "backend/credential_store.py", "LICENSE", "README.md"):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, rel)), "缺少 %s" % rel)
 
     def test_mobile_layout_and_row_progress(self):
@@ -278,7 +279,7 @@ class BackendContractTest(unittest.TestCase):
     def test_download_handler_starts_async_task(self):
         segment = ast.get_source_segment(
             self.tool_src, _method_node(_class_node(self.tree, "DownloadHandler"), "post")) or ""
-        self.assertIn("run_download", segment)
+        self.assertIn("_dispatch_jobs", segment)
         self.assertIn("_begin", segment)
 
     def test_no_direct_db_access(self):
@@ -338,6 +339,28 @@ class I18nTest(unittest.TestCase):
         for code, table in self.locales.items():
             missing = sorted(k for k in keys if k not in table)
             self.assertEqual(missing, [], "%s.json 缺少 app.js 引用的文案：%s" % (code, missing))
+
+    def test_quota_sync_timestamp_is_not_rendered(self):
+        self.assertNotIn("quotaUpdated", self.js)
+        start = self.js.index("function renderAccounts()")
+        end = self.js.index("\n  function ", start + 1)
+        self.assertNotIn("quota_updated_at", self.js[start:end])
+        for code, table in self.locales.items():
+            self.assertNotIn("quotaUpdated", table, code)
+
+    def test_entry_refresh_and_total_quota_bar(self):
+        self.assertIn('id="account-quota-summary"', self.html)
+        self.assertIn('id="account-quota-bar"', self.html)
+        self.assertIn('id="account-quota-fill"', self.html)
+        self.assertIn('id="account-quota-status"', self.html)
+        self.assertIn("function renderAccountQuotaSummary", self.js)
+        self.assertIn("function setAccountQuotaStatus", self.js)
+        self.assertIn("account.quota_stale", self.js)
+        self.assertIn("loadAccounts(true)", self.js)
+        self.assertNotIn("autoRefreshAccounts", self.js)
+        self.assertNotIn("accountsNeedRefresh", self.js)
+        self.assertNotIn("accountSummary", self.js)
+        self.assertNotIn('id="account-summary"', self.html)
 
     def test_backend_codes_are_translated(self):
         codes = set(EXTRA_ERROR_CODES)

@@ -3,9 +3,11 @@
 import hashlib
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 
@@ -98,6 +100,20 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(zlib_client.sanitize_filename('a/b:c*..', "x"),
                          "a b c")
         self.assertEqual(zlib_client.sanitize_filename("", "fallback"), "fallback")
+        self.assertEqual(zlib_client.sanitize_filename("", "a/b"), "a b")
+        long_cjk = "中" * 1000
+        clipped = zlib_client.sanitize_filename(long_cjk, "fallback")
+        self.assertLessEqual(len(clipped.encode("utf-8")), 200)
+        self.assertLessEqual(len((clipped + ".epub").encode("utf-8")), 209)
+        emoji = zlib_client.sanitize_filename("😀" * 1000, "fallback")
+        self.assertLessEqual(len(emoji.encode("utf-8")), 200)
+        self.assertEqual(zlib_client.sanitize_filename("", "x" * 1000),
+                         "x" * 200)
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, clipped + ".epub")
+            with open(dest, "wb") as handle:
+                handle.write(b"PK")
+            self.assertTrue(os.path.exists(dest))
 
     def test_http_entry_is_upgraded_and_http_download_rejected(self):
         self.assertEqual(zlib_client._normalize_entry("http://zlib.ch"),
@@ -263,6 +279,451 @@ class EntryRetryTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "entry.unreachable")
         self.assertEqual(first.calls, 1)
         self.assertEqual(second.calls, 0)
+
+    class FakeHttpResponse(object):
+        def __init__(self, status_code, url, location="", text=""):
+            self.status_code = status_code
+            self.url = url
+            self.headers = {}
+            if location:
+                self.headers["Location"] = location
+            self.text = text
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class QueueSession(object):
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = 0
+            self.closed = False
+            self.cookies = FakeCookies()
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            return self.responses.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    def test_entry_http_504_retries_with_new_session(self):
+        doorway = self.make_doorway()
+        first = self.FakeHttpResponse(504, "https://zlib.ch/")
+        ok = self.FakeHttpResponse(200, "https://zlib.ch/")
+        session = self.QueueSession([first, ok])
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session), \
+                mock.patch.object(zlib_client, "_ENTRY_HTTP_RETRY_DELAY", 0):
+            response = doorway._request("https://zlib.ch/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(session.calls, 2)
+        self.assertTrue(first.closed)
+
+    def test_entry_http_challenge_503_is_not_retried(self):
+        doorway = self.make_doorway()
+        challenge = self.FakeHttpResponse(
+            503, "https://zlib.ch/",
+            text="<html>Checking your browser a0_0x2a54</html>")
+        session = self.QueueSession([challenge])
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session):
+            response = doorway._request("https://zlib.ch/")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(session.calls, 1)
+
+    def test_entry_http_5xx_stops_after_retry_limit(self):
+        doorway = self.make_doorway()
+        responses = [
+            self.FakeHttpResponse(504, "https://zlib.ch/") for _ in range(3)]
+        session = self.QueueSession(responses)
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session), \
+                mock.patch.object(zlib_client, "_ENTRY_HTTP_RETRY_DELAY", 0):
+            response = doorway._request("https://zlib.ch/")
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(session.calls, 3)
+
+    def test_resolve_reports_entry_http_after_5xx_retries(self):
+        doorway = self.make_doorway()
+        redirect = self.FakeHttpResponse(
+            302, "https://zlib.ch/", location="https://mirror.example/")
+        responses = [redirect] + [
+            self.FakeHttpResponse(504, "https://mirror.example/")
+            for _ in range(3)]
+        session = self.QueueSession(responses)
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session), \
+                mock.patch.object(zlib_client, "_ENTRY_HTTP_RETRY_DELAY", 0):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                doorway._resolve()
+        self.assertEqual(ctx.exception.code, "entry.http")
+        self.assertIn("HTTP 504", ctx.exception.message)
+        self.assertIn("mirror.example", ctx.exception.message)
+        self.assertEqual(session.calls, 4)
+
+
+class TolerantOriginTest(unittest.TestCase):
+    def make_doorway(self):
+        return zlib_client.DoorwaySession("https://zlib.ch/", 5, "auto")
+
+    def test_tolerant_origin_accepts_5xx_landing_without_challenge(self):
+        doorway = self.make_doorway()
+        redirect = EntryRetryTest.FakeHttpResponse(
+            302, "https://zlib.ch/", location="https://mirror.example/")
+        landing = EntryRetryTest.FakeHttpResponse(
+            504, "https://mirror.example/")
+        session = EntryRetryTest.QueueSession([redirect, landing])
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session):
+            origin = doorway.tolerant_origin()
+        self.assertEqual(origin, "https://mirror.example")
+        self.assertEqual(doorway.tolerant_final, "https://mirror.example")
+        self.assertEqual(doorway.final_origin, "")
+        self.assertEqual([h["status"] for h in doorway.tolerant_hops],
+                         [302, 504])
+        self.assertEqual(session.calls, 2)
+
+    def test_tolerant_origin_is_cached_and_cleared_by_invalidate(self):
+        doorway = self.make_doorway()
+        doorway.tolerant_final = "https://mirror.example"
+        doorway.tolerant_at = time.time()
+        doorway.tolerant_hops = [{"url": "https://mirror.example", "status": 504}]
+        self.assertEqual(doorway.tolerant_origin(), "https://mirror.example")
+        doorway.invalidate()
+        self.assertEqual(doorway.tolerant_final, "")
+        self.assertEqual(doorway.tolerant_hops, [])
+
+    def test_resolve_failure_clears_stale_final_origin(self):
+        doorway = self.make_doorway()
+        doorway.final_origin = "https://old.example"
+        doorway.final_at = time.time()
+        doorway.hops = [{"url": "https://old.example", "status": 200}]
+        session = EntryRetryTest.QueueSession([
+            EntryRetryTest.FakeHttpResponse(504, "https://zlib.ch/")
+            for _ in range(3)])
+        doorway.session = session
+        with mock.patch.object(doorway, "_new_session", return_value=session), \
+                mock.patch.object(zlib_client, "_ENTRY_HTTP_RETRY_DELAY", 0):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                doorway._resolve()
+        self.assertEqual(ctx.exception.code, "entry.http")
+        self.assertEqual(doorway.final_origin, "")
+        self.assertEqual(doorway.hops, [])
+
+
+class OriginFallbackTest(unittest.TestCase):
+    def make_client(self):
+        return zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+
+    def test_entry_failure_uses_tolerant_origin_when_eapi_probe_passes(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError(
+            "entry.http", "HTTP 504 at https://zh.friday101.ru/")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example"), \
+                mock.patch.object(client, "_probe_origin",
+                                  return_value=True) as probe:
+            origin = client.origin()
+        self.assertEqual(origin, "https://mirror.example")
+        self.assertEqual(client._api_origin, "https://mirror.example")
+        probe.assert_called_once_with("https://mirror.example")
+
+    def test_entry_failure_keeps_original_error_when_probe_fails(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError(
+            "entry.http", "HTTP 504 at https://zh.friday101.ru/")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example"), \
+                mock.patch.object(client, "_probe_origin", return_value=False):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                client.origin()
+        self.assertEqual(ctx.exception.code, "entry.http")
+        self.assertIn("HTTP 504", ctx.exception.message)
+
+    def test_entry_failure_without_tolerant_origin_raises_original(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError("entry.unreachable", "timed out")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  side_effect=zlib_client.ZlibError(
+                                      "entry.unreachable", "timed out")):
+            with self.assertRaises(zlib_client.ZlibError) as ctx:
+                client.origin()
+        self.assertEqual(ctx.exception.code, "entry.unreachable")
+
+    def test_strict_origin_is_preferred(self):
+        client = self.make_client()
+        with mock.patch.object(client.doorway, "final",
+                               return_value="https://strict.example"), \
+                mock.patch.object(client.doorway, "tolerant_origin") as tolerant, \
+                mock.patch.object(client, "_probe_origin") as probe:
+            origin = client.origin()
+        self.assertEqual(origin, "https://strict.example")
+        tolerant.assert_not_called()
+        probe.assert_not_called()
+
+    def test_fallback_origin_is_reused_until_invalidated(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError("entry.http", "HTTP 504")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example") as tolerant, \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            self.assertEqual(client.origin(), "https://mirror.example")
+            self.assertEqual(client.origin(), "https://mirror.example")
+        self.assertEqual(tolerant.call_count, 1)
+        client.invalidate_origin("https://mirror.example")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example") as tolerant, \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            self.assertEqual(client.origin(), "https://mirror.example")
+        self.assertEqual(tolerant.call_count, 1)
+
+    def test_force_origin_bypasses_fallback_cache(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError("entry.http", "HTTP 504")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example") as tolerant, \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            client.origin()
+            client.origin(force=True)
+        self.assertEqual(tolerant.call_count, 2)
+
+    def test_invalidate_origin_does_not_clear_newer_fallback(self):
+        client = self.make_client()
+        client._api_origin = "https://new.example"
+        client._api_origin_at = time.time()
+        with mock.patch.object(client.doorway, "invalidate") as invalidate:
+            self.assertFalse(client.invalidate_origin("https://old.example"))
+        invalidate.assert_not_called()
+        self.assertEqual(client._api_origin, "https://new.example")
+
+    def test_probe_origin_accepts_success_json(self):
+        client = self.make_client()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"success": 1}
+        with mock.patch.object(client, "_request",
+                               return_value=response) as request:
+            self.assertTrue(client._probe_origin("https://mirror.example"))
+        self.assertTrue(request.call_args[0][1].endswith("/eapi/info/domains"))
+
+    def test_probe_origin_rejects_non_json(self):
+        client = self.make_client()
+        response = mock.Mock(status_code=504)
+        response.json.side_effect = ValueError("not json")
+        with mock.patch.object(client, "_request", return_value=response):
+            self.assertFalse(client._probe_origin("https://mirror.example"))
+
+    def test_probe_origin_rejects_redirect(self):
+        client = self.make_client()
+        response = mock.Mock(status_code=302)
+        response.json.return_value = {"success": 1}
+        with mock.patch.object(client, "_request",
+                               return_value=response) as request:
+            self.assertFalse(client._probe_origin("https://mirror.example"))
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+
+    def test_probe_origin_rejects_rejected_json(self):
+        client = self.make_client()
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"success": 0, "error": "nope"}
+        with mock.patch.object(client, "_request", return_value=response):
+            self.assertFalse(client._probe_origin("https://mirror.example"))
+
+    def test_force_origin_passes_force_to_tolerant_origin(self):
+        client = self.make_client()
+        error = zlib_client.ZlibError("entry.http", "HTTP 504")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example") as tolerant, \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            client.origin()
+            client.origin(force=True)
+        self.assertFalse(tolerant.call_args_list[0].kwargs["force"])
+        self.assertTrue(tolerant.call_args_list[1].kwargs["force"])
+
+    def test_tolerant_origin_is_dropped_when_eapi_probe_fails(self):
+        client = self.make_client()
+        client.doorway.tolerant_final = "https://mirror.example"
+        client.doorway.tolerant_at = time.time()
+        client.doorway.tolerant_hops = [
+            {"url": "https://mirror.example", "status": 504}]
+        error = zlib_client.ZlibError("entry.http", "HTTP 504")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client, "_probe_origin", return_value=False):
+            with self.assertRaises(zlib_client.ZlibError):
+                client.origin()
+        self.assertEqual(client.doorway.tolerant_final, "")
+        self.assertEqual(client.doorway.tolerant_hops, [])
+
+    def test_eapi_cache_is_scoped_to_origin(self):
+        client = self.make_client()
+        old = "https://old.example"
+        new = "https://new.example"
+        with mock.patch.object(
+                client, "_eapi_json",
+                side_effect=zlib_client.ZlibError("eapi.http", "HTTP 503")), \
+                mock.patch.object(client.doorway, "final_origin", old):
+            self.assertFalse(client.probe_eapi(old))
+        self.assertFalse(client._eapi)
+        self.assertEqual(client._eapi_origin, old)
+        with mock.patch.object(client, "_eapi_json",
+                               return_value={"success": 1}) as request:
+            self.assertTrue(client.probe_eapi(new))
+        request.assert_called_once()
+        self.assertTrue(client._eapi)
+        self.assertEqual(client._eapi_origin, new)
+
+    def test_set_api_origin_and_invalidate_clear_eapi_cache(self):
+        client = self.make_client()
+        client._api_origin = "https://a.example"
+        client._api_origin_at = time.time()
+        client._eapi = True
+        client._eapi_origin = "https://a.example"
+        client._set_api_origin("https://b.example")
+        self.assertIsNone(client._eapi)
+        self.assertEqual(client._eapi_origin, "")
+        client._eapi = False
+        client._eapi_origin = "https://b.example"
+        client.invalidate_origin("https://b.example")
+        self.assertIsNone(client._eapi)
+        self.assertEqual(client._eapi_origin, "")
+
+    class DualSession(object):
+        def __init__(self, get_responses, request_responses):
+            self.get_responses = list(get_responses)
+            self.request_responses = list(request_responses)
+            self.get_calls = 0
+            self.request_calls = 0
+            self.cookies = FakeCookies()
+
+        def get(self, url, **kwargs):
+            self.get_calls += 1
+            return self.get_responses.pop(0)
+
+        def request(self, method, url, **kwargs):
+            self.request_calls += 1
+            return self.request_responses.pop(0)
+
+        def close(self):
+            pass
+
+    class JsonResponse(object):
+        def __init__(self, status_code, url, payload):
+            self.status_code = status_code
+            self.url = url
+            self.text = ""
+            self.headers = {}
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    def test_entry_504_falls_back_to_eapi_verified_origin(self):
+        client = self.make_client()
+        redirect = lambda: EntryRetryTest.FakeHttpResponse(
+            302, "https://zlib.ch/", location="https://mirror.example/")
+        landing = lambda: EntryRetryTest.FakeHttpResponse(
+            504, "https://mirror.example/")
+        probe = self.JsonResponse(
+            200, "https://mirror.example/eapi/info/domains", {"success": 1})
+        session = self.DualSession(
+            get_responses=[
+                redirect(), landing(), landing(), landing(),
+                redirect(), landing(),
+            ],
+            request_responses=[probe],
+        )
+        client.doorway.session = session
+        with mock.patch.object(client.doorway, "_new_session",
+                               return_value=session), \
+                mock.patch.object(zlib_client, "_ENTRY_HTTP_RETRY_DELAY", 0):
+            origin = client.origin()
+        self.assertEqual(origin, "https://mirror.example")
+        self.assertTrue(client._api_is_fallback)
+        self.assertEqual(client.doorway.final_origin, "")
+        self.assertEqual(client.doorway.tolerant_final,
+                         "https://mirror.example")
+        self.assertEqual(session.request_calls, 1)
+        self.assertEqual(session.get_calls, 6)
+        self.assertTrue(client._eapi)
+        self.assertEqual(client._eapi_origin, "https://mirror.example")
+
+
+class HealthTest(unittest.TestCase):
+    def test_health_reports_fallback_origin(self):
+        client = zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+        client._api_origin = "https://mirror.example"
+        client._api_origin_at = time.time()
+        client._api_is_fallback = True
+        with mock.patch.object(
+                client, "origin", return_value="https://mirror.example"), \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            data = client.health()
+        self.assertEqual(data["final_origin"], "https://mirror.example")
+        self.assertTrue(data["fallback"])
+        self.assertTrue(data["eapi"])
+
+    def test_health_does_not_report_fallback_for_strict_origin(self):
+        client = zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+        client._api_origin = "https://strict.example"
+        client._api_origin_at = time.time()
+        client._api_is_fallback = False
+        with mock.patch.object(
+                client, "origin", return_value="https://strict.example"), \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            data = client.health()
+        self.assertFalse(data["fallback"])
+
+    def test_health_reports_fallback_after_strict_failure(self):
+        client = zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+        client.doorway.final_origin = "https://old.example"
+        client.doorway.final_at = time.time()
+        error = zlib_client.ZlibError("entry.http", "HTTP 504")
+        with mock.patch.object(client.doorway, "final", side_effect=error), \
+                mock.patch.object(client.doorway, "tolerant_origin",
+                                  return_value="https://mirror.example"), \
+                mock.patch.object(client, "_probe_origin", return_value=True):
+            data = client.health()
+        self.assertEqual(data["final_origin"], "https://mirror.example")
+        self.assertTrue(data["fallback"])
+
+    def test_health_reuses_cached_eapi_probe_result(self):
+        client = zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+        client._api_origin = "https://mirror.example"
+        client._api_origin_at = time.time()
+        client._api_is_fallback = True
+        client._eapi = True
+        client._eapi_origin = "https://mirror.example"
+        with mock.patch.object(
+                client, "origin", return_value="https://mirror.example"), \
+                mock.patch.object(client, "_probe_origin") as probe:
+            data = client.health()
+        probe.assert_not_called()
+        self.assertTrue(data["eapi"])
+
+    def test_health_probes_fresh_for_strict_cached_result(self):
+        client = zlib_client.ZlibClient("https://zlib.ch/", "auto", 5)
+        client._api_origin = "https://strict.example"
+        client._api_origin_at = time.time()
+        client._api_is_fallback = False
+        client._eapi = True
+        client._eapi_origin = "https://strict.example"
+        with mock.patch.object(
+                client, "origin", return_value="https://strict.example"), \
+                mock.patch.object(client, "_probe_origin",
+                                  return_value=True) as probe:
+            data = client.health()
+        probe.assert_called_once_with("https://strict.example")
+        self.assertTrue(data["eapi"])
 
 
 class OriginRetryTest(unittest.TestCase):
@@ -444,7 +905,7 @@ class EapiTest(unittest.TestCase):
 
         client._eapi_json = fake_json
         client.eapi_search("https://origin.test", "三体", 2, 20, {
-            "languages": ["zh"], "extensions": ["EPUB"],
+            "languages": ["chinese"], "extensions": ["EPUB"],
             "year_from": 2000, "year_to": 2024, "order": "newest", "exact": True,
         })
         self.assertEqual(captured["method"], "POST")
@@ -453,12 +914,33 @@ class EapiTest(unittest.TestCase):
         self.assertEqual(data["message"], "三体")
         self.assertEqual(data["page"], "2")
         self.assertEqual(data["limit"], "20")
-        self.assertEqual(data["languages[]"], ["zh"])
+        self.assertEqual(data["languages[]"], ["chinese"])
         self.assertEqual(data["extensions[]"], ["epub"])
         self.assertEqual(data["yearFrom"], "2000")
         self.assertEqual(data["yearTo"], "2024")
         self.assertEqual(data["order"], "newest")
         self.assertEqual(data["e"], "1")
+
+    def test_html_search_passes_filters(self):
+        client = zlib_client.ZlibClient("https://example.test/", "system", 5)
+        captured = {}
+        response = mock.Mock(status_code=200, text=(
+            '<z-bookcard id="1" href="/book/1/x.html" extension="epub">'
+            '<div slot="title">T</div></z-bookcard>'))
+        client._request_challenge_aware = (
+            lambda method, url, **kwargs: captured.update({"url": url}) or response)
+        client.html_search("https://origin.test", "三体", 2, filters={
+            "languages": ["chinese"], "extensions": ["EPUB"],
+            "year_from": 2000, "year_to": 2024, "order": "newest", "exact": True,
+        }, timeout=5)
+        query = parse_qs(urlsplit(captured["url"]).query)
+        self.assertEqual(query["page"], ["2"])
+        self.assertEqual(query["languages[]"], ["chinese"])
+        self.assertEqual(query["extensions[]"], ["epub"])
+        self.assertEqual(query["yearFrom"], ["2000"])
+        self.assertEqual(query["yearTo"], ["2024"])
+        self.assertEqual(query["order"], ["newest"])
+        self.assertEqual(query["e"], ["1"])
 
     def test_profile_quota_mapping(self):
         client = zlib_client.ZlibClient("https://example.test/", "system", 5)

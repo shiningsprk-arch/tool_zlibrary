@@ -27,6 +27,7 @@
     dnsSelect: el('dns-select'),
     timeoutInput: el('timeout-input'),
     maxmbInput: el('maxmb-input'),
+    concurrencyInput: el('concurrency-input'),
     tagInput: el('tag-input'),
     rotationSelect: el('rotation-select'),
     guestInput: el('guest-input'),
@@ -56,8 +57,13 @@
     nextBtn: el('next-btn'),
     pageInfo: el('page-info'),
     accountsToggle: el('accounts-toggle'),
+    accountsRefresh: el('accounts-refresh'),
     accountsPanel: el('accounts-panel'),
-    accountSummary: el('account-summary'),
+    accountQuotaSummary: el('account-quota-summary'),
+    accountQuotaValue: el('account-quota-value'),
+    accountQuotaBar: el('account-quota-bar'),
+    accountQuotaFill: el('account-quota-fill'),
+    accountQuotaStatus: el('account-quota-status'),
     accountList: el('account-list'),
     accountLabel: el('account-label'),
     accountMode: el('account-mode'),
@@ -68,8 +74,16 @@
     bsrvInput: el('bsrv-input'),
     accountEmail: el('account-email'),
     accountPassword: el('account-password'),
+    accountSavePassword: el('account-save-password'),
     addAccountBtn: el('add-account-btn'),
     accountNotice: el('account-notice'),
+    accountCredentialsEditor: el('account-credentials-editor'),
+    accountEditTarget: el('account-edit-target'),
+    accountEditEmail: el('account-edit-email'),
+    accountEditPassword: el('account-edit-password'),
+    accountEditSave: el('account-edit-save'),
+    accountEditCancel: el('account-edit-cancel'),
+    accountEditNotice: el('account-edit-notice'),
   };
 
   var state = {
@@ -88,10 +102,16 @@
     lastError: null,
     doneTitle: '',
     doneTimer: null,
+    refreshingAccounts: false,
+    loadingAccounts: false,
+    accountsLoaded: false,
+    editingAccountId: '',
+    savingCredentials: false,
   };
 
   function jobIsActive(job) {
-    return !!job && (job.status === 'running' || job.status === 'starting');
+    return !!job && (job.status === 'queued' || job.status === 'running'
+      || job.status === 'starting');
   }
 
   function activeJobForToken(token) {
@@ -158,10 +178,8 @@
       }
       state.settings = rsp.data;
       state.meta = rsp.data.filters || {};
-      state.accounts = rsp.data.accounts || [];
       fillSettings(rsp.data);
       buildFilters(state.meta);
-      renderAccounts();
     }).catch(function () { /* 宿主未登录/预览场景静默 */ });
   }
 
@@ -170,6 +188,7 @@
     dom.dnsSelect.value = config.dns_mode || 'auto';
     dom.timeoutInput.value = config.timeout || 30;
     dom.maxmbInput.value = config.max_mb || 200;
+    dom.concurrencyInput.value = config.max_concurrent || 4;
     dom.tagInput.value = config.tag || '';
     dom.rotationSelect.value = config.rotation || 'least_used';
     dom.guestInput.checked = !!config.guest_enabled;
@@ -181,6 +200,7 @@
       dns_mode: dom.dnsSelect.value,
       timeout: parseInt(dom.timeoutInput.value, 10) || 30,
       max_mb: parseInt(dom.maxmbInput.value, 10) || 200,
+      max_concurrent: parseInt(dom.concurrencyInput.value, 10) || 4,
       tag: dom.tagInput.value.trim(),
       rotation: dom.rotationSelect.value,
       guest_enabled: dom.guestInput.checked,
@@ -193,9 +213,7 @@
         return;
       }
       state.settings = rsp.data;
-      state.accounts = rsp.data.accounts || state.accounts;
       fillSettings(rsp.data);
-      renderAccounts();
       renderError(null);
       notify(i18n.t('saved'), 'success');
     }).catch(function (err) {
@@ -217,11 +235,17 @@
         return;
       }
       var data = rsp.data;
-      dom.healthStatus.textContent = i18n.t('healthOk', {
-        origin: data.final_origin || '?',
-        mode: data.eapi ? i18n.t('sourceEapi') : i18n.t('sourceHtml'),
-      });
-      var hops = (data.hops || []).map(function (hop, index) {
+      var sourceHops = data.fallback ? (data.fallback_hops || []) : (data.hops || []);
+      dom.healthStatus.textContent = data.fallback
+        ? i18n.t('healthFallbackOk', {
+          origin: data.final_origin || '?',
+          mode: data.eapi ? i18n.t('sourceEapi') : i18n.t('sourceHtml'),
+        })
+        : i18n.t('healthOk', {
+          origin: data.final_origin || '?',
+          mode: data.eapi ? i18n.t('sourceEapi') : i18n.t('sourceHtml'),
+        });
+      var hops = sourceHops.map(function (hop, index) {
         return (index + 1) + '. ' + hop.status + ' ' + hop.url +
           (hop.challenge !== undefined ? ' [' + i18n.t('healthChallenge') + ']' : '');
       });
@@ -543,6 +567,17 @@
     if (!active && job.status === 'completed') {
       percent = 100;
     }
+    if (job.status === 'queued') {
+      parts.text.className = 'hint';
+      parts.text.textContent = i18n.t('queueText', {
+        position: job.queue_position || '?',
+      });
+      parts.cancel.hidden = false;
+      parts.cancel.textContent = i18n.t('cancelBtn');
+      parts.barWrap.classList.add('mb-progress-linear--indeterminate');
+      parts.bar.style.width = '';
+      return;
+    }
     var stageKey = {
       prepare: 'stagePrepare', downloading: 'stageDownloading',
       importing: 'stageImporting', done: 'stageDone',
@@ -599,7 +634,8 @@
         job.status !== 'cancelled') {
       return;
     }
-    if (previousStatus !== 'running' && previousStatus !== 'starting') {
+    if (previousStatus !== 'running' && previousStatus !== 'starting'
+        && previousStatus !== 'queued') {
       return;
     }
     job.notified = true;
@@ -626,6 +662,9 @@
     };
     renderError(failure);
     notify(errorText(failure), job.status === 'cancelled' ? 'warning' : 'error');
+    if (job.status === 'failed') {
+      loadAccounts();
+    }
     dropOrphanProgress(job);
   }
 
@@ -655,6 +694,7 @@
     Object.assign(job, raw);
     job.job_id = raw.job_id;
     job.book_token = raw.book_token || job.book_token;
+    job.missingPolls = 0;
     if (job.book_token) {
       state.jobByToken[job.book_token] = job.job_id;
     }
@@ -698,11 +738,12 @@
       var jobId = (rsp.data && rsp.data.job_id) || token;
       var job = state.jobs[jobId];
       if (!job) {
+        var queued = !!(rsp.data && rsp.data.queued);
         job = {
           job_id: jobId,
           book_token: token,
-          status: 'starting',
-          stage: 'prepare',
+          status: queued ? 'queued' : 'starting',
+          stage: queued ? 'queued' : 'prepare',
           progress: 0,
           current: titleEl ? titleEl.textContent : '',
         };
@@ -749,11 +790,39 @@
       return;
     }
     var jobs = rsp.data.jobs || [];
+    var received = {};
     jobs.forEach(function (raw) {
       if (initial && !jobIsActive(raw)) {
         return;
       }
+      received[raw.job_id] = true;
       updateJob(raw);
+    });
+    // 后端会清理旧的终态记录；本页也要移除对应节点，避免幽灵任务一直轮询。
+    Object.keys(state.jobs).forEach(function (jobId) {
+      var job = state.jobs[jobId];
+      if (received[jobId]) {
+        return;
+      }
+      job.missingPolls = (job.missingPolls || 0) + 1;
+      if (jobIsActive(job) && job.missingPolls < 2) {
+        // 单次轮询缺失可能是乱序响应；连续两次仍缺失才判定任务丢失。
+        return;
+      }
+      if (jobIsActive(job)) {
+        var previous = job.status;
+        job.status = 'failed';
+        job.error = 'task.failed';
+        job.detail = '';
+        handleTerminalJob(job, previous);
+      }
+      if (job.node && job.node.parentNode) {
+        job.node.parentNode.removeChild(job.node);
+      }
+      delete state.jobs[jobId];
+      if (job.book_token && state.jobByToken[job.book_token] === jobId) {
+        delete state.jobByToken[job.book_token];
+      }
     });
     refreshActiveJobs();
     if (anyJobActive()) {
@@ -786,14 +855,88 @@
 
   // ------------------------------------------------------------------ 账号
 
-  function loadAccounts() {
+  function loadAccounts(refreshQuotas) {
+    if (state.loadingAccounts) {
+      return Promise.resolve();
+    }
+    state.loadingAccounts = true;
     return api('accounts').then(function (rsp) {
+      state.loadingAccounts = false;
       if (!rsp || rsp.err !== 'ok' || !rsp.data) {
+        if (refreshQuotas) {
+          setAccountQuotaStatus(i18n.t('quotaRefreshFailed'), true);
+        }
         return;
       }
       state.accounts = rsp.data.accounts || [];
+      state.accountsLoaded = true;
+      if (!state.accounts.length) {
+        setAccountQuotaStatus('', false);
+      }
       renderAccounts();
-    }).catch(function () { /* 静默 */ });
+      var hasEnabled = state.accounts.some(function (account) {
+        return account.enabled;
+      });
+      if (!hasEnabled) {
+        setAccountQuotaStatus('', false);
+      } else if (refreshQuotas) {
+        refreshAccountQuotas();
+      }
+    }).catch(function () {
+      state.loadingAccounts = false;
+      if (!state.accounts.length) {
+        state.accountsLoaded = false;
+      }
+      if (refreshQuotas) {
+        setAccountQuotaStatus(i18n.t('quotaRefreshFailed'), true);
+      }
+    });
+  }
+
+  function setAccountQuotaStatus(message, isError) {
+    dom.accountQuotaStatus.textContent = message || '';
+    dom.accountQuotaStatus.hidden = !message;
+    dom.accountQuotaStatus.classList.toggle('job-error', !!isError);
+  }
+
+  function refreshAccountQuotas() {
+    if (state.refreshingAccounts) {
+      return;
+    }
+    if (!state.accounts.length) {
+      if (!state.accountsLoaded && !state.loadingAccounts) {
+        loadAccounts(true);
+      }
+      return;
+    }
+    state.refreshingAccounts = true;
+    dom.accountsRefresh.disabled = true;
+    setAccountQuotaStatus(i18n.t('refreshingQuota'), false);
+    postJson('accounts', {
+      action: 'refresh',
+    }).then(function (rsp) {
+      state.refreshingAccounts = false;
+      dom.accountsRefresh.disabled = false;
+      if (!rsp || rsp.err !== 'ok') {
+        setAccountQuotaStatus(i18n.t('quotaRefreshFailed'), true);
+        return;
+      }
+      state.accounts = (rsp.data && rsp.data.accounts) || state.accounts;
+      renderAccounts();
+      var attempted = Number(rsp.data && rsp.data.attempted) || 0;
+      var failed = Number(rsp.data && rsp.data.failed) || 0;
+      if (failed) {
+        setAccountQuotaStatus(i18n.t(
+          failed >= attempted ? 'quotaRefreshFailed' : 'quotaRefreshPartial',
+          { failed: failed, attempted: attempted }), true);
+      } else {
+        setAccountQuotaStatus('', false);
+      }
+    }).catch(function () {
+      state.refreshingAccounts = false;
+      dom.accountsRefresh.disabled = false;
+      setAccountQuotaStatus(i18n.t('quotaRefreshFailed'), true);
+    });
   }
 
   function accountStatusText(account) {
@@ -804,8 +947,18 @@
   }
 
   function quotaText(account) {
-    if (account.quota_today === null || account.quota_limit === null ||
-        account.quota_today === undefined || account.quota_limit === undefined) {
+    var hasQuota = account.quota_today !== null &&
+      account.quota_limit !== null &&
+      account.quota_today !== undefined &&
+      account.quota_limit !== undefined;
+    if (account.status === 'exhausted' && hasQuota) {
+      return i18n.t('quotaText', {
+        today: account.quota_today,
+        limit: account.quota_limit,
+        remaining: 0,
+      });
+    }
+    if (account.quota_stale || account.status === 'invalid' || !hasQuota) {
       return i18n.t('quotaUnknown');
     }
     return i18n.t('quotaText', {
@@ -815,7 +968,84 @@
     });
   }
 
+  function renderAccountQuotaSummary() {
+    var enabled = state.accounts.filter(function (account) {
+      return account.enabled;
+    });
+    if (!enabled.length) {
+      dom.accountQuotaValue.textContent = '';
+      dom.accountQuotaFill.style.width = '0%';
+      dom.accountQuotaBar.hidden = true;
+      dom.accountQuotaBar.removeAttribute('aria-valuenow');
+      dom.accountQuotaSummary.hidden = true;
+      return;
+    }
+    var totalLimit = 0;
+    var totalRemaining = 0;
+    var unknown = 0;
+    var known = false;
+    enabled.forEach(function (account) {
+      var hasQuota = account.quota_today !== null &&
+        account.quota_limit !== null &&
+        account.quota_today !== undefined &&
+        account.quota_limit !== undefined;
+      var today = hasQuota ? Number(account.quota_today) : NaN;
+      var limit = hasQuota ? Number(account.quota_limit) : NaN;
+      var validQuota = isFinite(today) && isFinite(limit) && limit > 0;
+      // exhausted 是明确的“剩余 0”，即使额度已 stale 也按 0/上限计入。
+      if (account.status === 'exhausted') {
+        if (!validQuota) {
+          unknown += 1;
+          return;
+        }
+        known = true;
+        totalLimit += limit;
+        return;
+      }
+      // invalid/stale 的额度是旧值，不能当作当前可用额度。
+      if (account.status === 'invalid' || account.quota_stale) {
+        unknown += 1;
+        return;
+      }
+      if (!validQuota) {
+        unknown += 1;
+        return;
+      }
+      known = true;
+      totalLimit += limit;
+      totalRemaining += Math.max(0, limit - today);
+    });
+    dom.accountQuotaSummary.hidden = false;
+    dom.accountQuotaBar.hidden = !known;
+    var percent = 0;
+    if (known) {
+      percent = totalLimit > 0
+        ? Math.min(100, Math.round(totalRemaining / totalLimit * 100))
+        : 0;
+      var value = i18n.t('totalQuotaValue', {
+        remaining: totalRemaining,
+        limit: totalLimit,
+      });
+      if (unknown) {
+        value += i18n.t('totalQuotaUnknownCount', { count: unknown });
+      }
+      dom.accountQuotaValue.textContent = value;
+      dom.accountQuotaBar.setAttribute('aria-valuenow', String(percent));
+    } else {
+      dom.accountQuotaValue.textContent = i18n.t('quotaUnknown');
+      dom.accountQuotaBar.removeAttribute('aria-valuenow');
+    }
+    dom.accountQuotaFill.style.width = percent + '%';
+  }
+
+  function findAccountById(id) {
+    return state.accounts.filter(function (item) { return item.id === id; })[0] || null;
+  }
+
   function renderAccounts() {
+    if (state.editingAccountId && !findAccountById(state.editingAccountId)) {
+      closeCredentialsEditor();
+    }
     dom.accountList.textContent = '';
     if (!state.accounts.length) {
       var empty = document.createElement('p');
@@ -850,6 +1080,12 @@
           email.textContent = account.email;
           name.appendChild(email);
         }
+        if (account.auto_renew) {
+          var autoRenew = document.createElement('div');
+          autoRenew.className = 'hint';
+          autoRenew.textContent = i18n.t('autoRenewOn');
+          name.appendChild(autoRenew);
+        }
         row.appendChild(name);
         var status = document.createElement('td');
         status.setAttribute('data-label', i18n.t('statusLabel'));
@@ -875,6 +1111,8 @@
         var actions = document.createElement('td');
         actions.setAttribute('data-label', i18n.t('actionsLabel'));
         actions.appendChild(accountButton('test', account.id, 'testBtn'));
+        actions.appendChild(accountButton('credentials', account.id,
+          'updateLoginBtn'));
         actions.appendChild(accountButton('toggle', account.id,
           account.enabled ? 'disableBtn' : 'enableBtn'));
         actions.appendChild(accountButton('delete', account.id, 'deleteBtn'));
@@ -884,12 +1122,15 @@
       table.appendChild(tbody);
       dom.accountList.appendChild(table);
     }
-    var usable = state.accounts.filter(function (account) {
-      return account.enabled && account.status !== 'invalid' && account.status !== 'exhausted';
-    }).length;
-    dom.accountSummary.textContent = i18n.t('accountSummary', {
-      total: state.accounts.length, usable: usable,
-    });
+    renderAccountQuotaSummary();
+    if (state.editingAccountId) {
+      var editing = findAccountById(state.editingAccountId);
+      if (editing) {
+        dom.accountEditTarget.textContent = i18n.t('updateLoginTarget', {
+          name: editing.label || editing.id,
+        });
+      }
+    }
   }
 
   function accountButton(action, id, labelKey) {
@@ -910,7 +1151,98 @@
     }
   }
 
+  function clearCredentialInputs() {
+    dom.accountEditEmail.value = '';
+    dom.accountEditPassword.value = '';
+  }
+
+  function closeCredentialsEditor() {
+    state.editingAccountId = '';
+    state.savingCredentials = false;
+    dom.accountCredentialsEditor.hidden = true;
+    dom.accountEditSave.disabled = false;
+    dom.accountEditCancel.disabled = false;
+    dom.accountEditNotice.textContent = '';
+    clearCredentialInputs();
+  }
+
+  function openCredentialsEditor(id) {
+    if (state.savingCredentials) {
+      return;
+    }
+    var account = findAccountById(id);
+    if (!account) {
+      return;
+    }
+    state.editingAccountId = id;
+    state.savingCredentials = false;
+    dom.accountEditTarget.textContent = i18n.t('updateLoginTarget', {
+      name: account.label || account.id,
+    });
+    dom.accountEditNotice.textContent = '';
+    dom.accountEditSave.disabled = false;
+    dom.accountEditCancel.disabled = false;
+    clearCredentialInputs();
+    dom.accountEditEmail.placeholder = account.email || '';
+    dom.accountCredentialsEditor.hidden = false;
+    if (dom.accountCredentialsEditor.scrollIntoView) {
+      dom.accountCredentialsEditor.scrollIntoView({ block: 'nearest' });
+    }
+    dom.accountEditEmail.focus();
+  }
+
+  function saveAccountCredentials() {
+    var id = state.editingAccountId;
+    if (!id || state.savingCredentials) {
+      return;
+    }
+    var email = dom.accountEditEmail.value.trim();
+    var password = dom.accountEditPassword.value;
+    if (!email || !password) {
+      dom.accountEditNotice.textContent = i18n.t('needCredentials');
+      return;
+    }
+    var body = {
+      action: 'update_login',
+      id: id,
+      email: email,
+      password: password,
+    };
+    state.savingCredentials = true;
+    dom.accountEditSave.disabled = true;
+    dom.accountEditCancel.disabled = true;
+    dom.accountEditNotice.textContent = i18n.t('accountLoginSaving');
+    postJson('accounts', body).then(function (rsp) {
+      state.savingCredentials = false;
+      dom.accountEditSave.disabled = false;
+      dom.accountEditCancel.disabled = false;
+      if (!rsp || rsp.err !== 'ok') {
+        dom.accountEditNotice.textContent = errorText(
+          rsp || { err: 'request_failed' });
+        return;
+      }
+      state.accounts = (rsp.data && rsp.data.accounts) || state.accounts;
+      state.accountsLoaded = true;
+      closeCredentialsEditor();
+      renderAccounts();
+      setAccountQuotaStatus('', false);
+      dom.accountNotice.textContent = i18n.t('accountLoginUpdated');
+      notify(i18n.t('accountLoginUpdated'), 'success');
+    }).catch(function (err) {
+      state.savingCredentials = false;
+      dom.accountEditSave.disabled = false;
+      dom.accountEditCancel.disabled = false;
+      dom.accountEditNotice.textContent = errorText({
+        err: 'request_failed', msg: String((err && err.message) || err),
+      });
+    });
+  }
+
   function onAccountAction(action, id) {
+    if (action === 'credentials') {
+      openCredentialsEditor(id);
+      return;
+    }
     var body = { id: id };
     if (action === 'test') {
       body.action = 'test';
@@ -930,9 +1262,15 @@
         return;
       }
       state.accounts = (rsp.data && rsp.data.accounts) || state.accounts;
+      state.accountsLoaded = true;
       renderAccounts();
-      dom.accountNotice.textContent = action === 'test'
-        ? i18n.t('accountTested') : i18n.t('accountSaved');
+      setAccountQuotaStatus('', false);
+      var testedStale = action === 'test' && rsp.data && rsp.data.account &&
+        rsp.data.account.quota_stale;
+      dom.accountNotice.textContent = testedStale
+        ? i18n.t('accountTestedStale')
+        : (action === 'test' ? i18n.t('accountTested')
+                             : i18n.t('accountSaved'));
     }).catch(function (err) {
       dom.accountNotice.textContent = errorText({
         err: 'request_failed', msg: String((err && err.message) || err),
@@ -947,6 +1285,7 @@
     dom.bsrvInput.value = '';
     dom.accountEmail.value = '';
     dom.accountPassword.value = '';
+    dom.accountSavePassword.checked = true;
   }
 
   function addAccount() {
@@ -959,6 +1298,7 @@
     if (mode === 'password') {
       body.email = dom.accountEmail.value.trim();
       body.password = dom.accountPassword.value;
+      body.save_password = dom.accountSavePassword.checked;
       if (!body.email || !body.password) {
         dom.accountNotice.textContent = i18n.t('needCredentials');
         return;
@@ -982,7 +1322,9 @@
       }
       clearAccountInputs();
       state.accounts = (rsp.data && rsp.data.accounts) || state.accounts;
+      state.accountsLoaded = true;
       renderAccounts();
+      setAccountQuotaStatus('', false);
       dom.accountNotice.textContent = i18n.t('accountAdded');
     }).catch(function (err) {
       dom.addAccountBtn.disabled = false;
@@ -1045,6 +1387,9 @@
   dom.accountsToggle.addEventListener('click', function () {
     dom.accountsPanel.hidden = !dom.accountsPanel.hidden;
   });
+  dom.accountsRefresh.addEventListener('click', function () {
+    refreshAccountQuotas();
+  });
   function syncAccountMode() {
     var password = dom.accountMode.value === 'password';
     dom.passwordFields.hidden = !password;
@@ -1054,6 +1399,17 @@
   dom.accountMode.addEventListener('change', syncAccountMode);
   syncAccountMode();
   dom.addAccountBtn.addEventListener('click', addAccount);
+  dom.accountEditSave.addEventListener('click', saveAccountCredentials);
+  dom.accountEditCancel.addEventListener('click', closeCredentialsEditor);
+  [dom.accountEditEmail, dom.accountEditPassword]
+    .forEach(function (input) {
+      input.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          saveAccountCredentials();
+        }
+      });
+    });
 
   dom.resultList.addEventListener('click', function (event) {
     var button = event.target.closest('button[data-action="download"]');
@@ -1096,7 +1452,7 @@
     updateDoneText();
   });
   loadConfig();
-  loadAccounts();
+  loadAccounts(true);
   api('progress').then(function (rsp) {
     // 只恢复进行中的任务；completed/failed/cancelled 是上一次会话的残留，
     // 重新进入工具时不再回放 doneMsg / 旧错误。

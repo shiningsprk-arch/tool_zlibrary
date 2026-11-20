@@ -3,12 +3,12 @@
 
 入口固定为工具设置的 entry_url（默认 https://zlib.ch/）；最终域由 DoorwaySession
 跟随跳转决定，不写死在代码里。搜索/下载优先 EAPI，失败回退 HTML 页面接口。
-账号只保存会话 cookie/key，不保存邮箱密码。
+账号默认只保存会话 cookie/key；用户主动开启自动续期时，密码以 AES-GCM 密文
+保存在工具数据目录，解密密钥与配置文件分开存放。
 
 路由挂载在 /api/toolbox/tool/zlibrary（由 manifest.json 的 api_routes 决定）。
 """
 import functools
-import json
 import logging
 import os
 import re
@@ -23,9 +23,11 @@ import tornado.ioloop
 from webserver.handlers.base import BaseHandler, is_admin, js
 from webserver.i18n import _
 from webserver.services import AsyncService
+from webserver.services.background_service import BackgroundService, BackgroundTask
 from webserver.toolbox.base_tool import BaseTool
 
 from . import accounts as pool
+from . import credential_store
 from . import zlib_client
 from .zlib_client import ZlibError
 
@@ -34,11 +36,14 @@ _SEARCH_TTL = 2 * 3600
 _MAX_SEARCH_CACHE = 600
 _MAX_ACCOUNTS = 20
 _MAX_CONCURRENT = 4
+_MAX_CONCURRENT_LIMIT = 8
+_MAX_QUEUE = 50
 _JOB_KEEP = 10 * 60
-_MAX_JOB_RECORDS = 40
+_MAX_JOB_RECORDS = 80
 _ENTRY_DEFAULT = zlib_client.DEFAULT_ENTRY
 _CONFIG_KEYS = ("entry_url", "dns_mode", "timeout", "max_mb", "tag",
-                "guest_enabled", "rotation", "search_limit")
+                "guest_enabled", "rotation", "search_limit", "max_concurrent")
+_INTERNAL_CONFIG_KEYS = ("rotation_cursor",)
 _DNS_MODES = ("auto", "system", "doh")
 _DEFAULT_CONFIG = {
     "entry_url": _ENTRY_DEFAULT,
@@ -48,7 +53,9 @@ _DEFAULT_CONFIG = {
     "tag": "",
     "guest_enabled": True,
     "rotation": "least_used",
+    "rotation_cursor": "",
     "search_limit": 20,
+    "max_concurrent": _MAX_CONCURRENT,
 }
 _LANGUAGE_OPTIONS = [
     ("zh", "Chinese"), ("zh-Hant", "Traditional Chinese"), ("en", "English"),
@@ -57,6 +64,23 @@ _LANGUAGE_OPTIONS = [
     ("ar", "Arabic"), ("nl", "Dutch"), ("pl", "Polish"), ("tr", "Turkish"),
     ("vi", "Vietnamese"), ("id", "Indonesian"), ("hi", "Hindi"),
 ]
+# EAPI/HTML 搜索使用的是英文语言名，不是 ISO 代码；zh-Hant 没有独立取值。
+_LANGUAGE_SEARCH_NAMES = {
+    "zh": "chinese", "zh-Hant": "chinese", "en": "english",
+    "ja": "japanese", "ko": "korean", "fr": "french", "de": "german",
+    "es": "spanish", "it": "italian", "pt": "portuguese", "ru": "russian",
+    "ar": "arabic", "nl": "dutch", "pl": "polish", "tr": "turkish",
+    "vi": "vietnamese", "id": "indonesian", "hi": "hindi",
+}
+
+
+def _search_language_names(values):
+    names = []
+    for value in values or []:
+        name = _LANGUAGE_SEARCH_NAMES.get(str(value), str(value)).strip().lower()
+        if name and name not in names:
+            names.append(name)
+    return names
 _EXTENSION_OPTIONS = ["epub", "pdf", "mobi", "azw3", "fb2", "djvu", "txt", "cbz", "cbr"]
 _ORDER_OPTIONS = [
     ("", "Most relevant"), ("newest", "Newest"), ("oldest", "Oldest"),
@@ -65,8 +89,13 @@ _ORDER_OPTIONS = [
 # 下载期间会变化的账号字段；持久化时只按 id 合并这些字段，不能整份覆盖号池，
 # 否则会丢掉下载过程中新增/修改/删除的账号。
 _ACCOUNT_RUNTIME_FIELDS = (
-    "email", "status", "quota_today", "quota_limit", "quota_updated_at",
-    "last_used", "cooldown_until", "last_error",
+    "status", "quota_today", "quota_limit", "quota_updated_at",
+    "quota_stale", "quota_stale_at", "state_updated_at", "last_used",
+    "cooldown_until", "last_error",
+)
+_ACCOUNT_IDENTITY_FIELDS = (
+    "email", "password_enc", "remix_userid", "remix_userkey", "bsrv",
+    "auto_renew",
 )
 
 
@@ -91,6 +120,9 @@ class ZlibraryTool(BaseTool):
     _jobs = {}
     _jobs_lock = threading.RLock()
     _cancel_events = {}
+    _job_meta = {}
+    _dispatch_lock = threading.RLock()
+    _refresh_lock = threading.Lock()
     _account_lock = threading.RLock()
     _persist_lock = threading.RLock()
     _import_lock = threading.Lock()
@@ -106,9 +138,9 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.2.1",
+            "revision": "0.3.0",
             "author": "黏菌",
-            "publish_date": "2026-11-17",
+            "publish_date": "2026-11-20",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
         }
 
@@ -121,15 +153,19 @@ class ZlibraryTool(BaseTool):
     def _load_config(self):
         stored = self.api.storage.get_config() or {}
         config = dict(_DEFAULT_CONFIG)
-        for key in _CONFIG_KEYS:
+        for key in _CONFIG_KEYS + _INTERNAL_CONFIG_KEYS:
             if key in stored:
                 config[key] = stored[key]
+        config["rotation_cursor"] = str(config.get("rotation_cursor") or "")
         config["entry_url"] = _normalize_entry(config.get("entry_url"))
         config["dns_mode"] = (config.get("dns_mode")
                               if config.get("dns_mode") in _DNS_MODES else "auto")
         config["timeout"] = _bounded_int(config.get("timeout"), 5, 120, 30)
         config["max_mb"] = _bounded_int(config.get("max_mb"), 1, 2048, 200)
         config["search_limit"] = _bounded_int(config.get("search_limit"), 5, 50, 20)
+        config["max_concurrent"] = _bounded_int(
+            config.get("max_concurrent"), 1, _MAX_CONCURRENT_LIMIT,
+            _MAX_CONCURRENT)
         config["tag"] = str(config.get("tag") or "").strip()[:60]
         config["guest_enabled"] = bool(config.get("guest_enabled", True))
         config["rotation"] = (config.get("rotation")
@@ -149,7 +185,10 @@ class ZlibraryTool(BaseTool):
 
     def save_config(self, patch):
         with self._persist_lock:
-            return self._save_config(patch)
+            data = self._save_config(patch)
+        # 在释放持久化锁后再补位，避免 persist→dispatch 与 dispatch→persist 形成反向锁序。
+        self._dispatch_jobs()
+        return data
 
     def _save_config(self, patch):
         config = self.load_config()
@@ -161,9 +200,11 @@ class ZlibraryTool(BaseTool):
                 config[key] = _normalize_entry(value)
             elif key == "dns_mode":
                 config[key] = value if value in _DNS_MODES else "auto"
-            elif key in ("timeout", "max_mb", "search_limit"):
+            elif key in ("timeout", "max_mb", "search_limit", "max_concurrent"):
                 limits = {"timeout": (5, 120, 30), "max_mb": (1, 2048, 200),
-                          "search_limit": (5, 50, 20)}[key]
+                          "search_limit": (5, 50, 20),
+                          "max_concurrent": (1, _MAX_CONCURRENT_LIMIT,
+                                             _MAX_CONCURRENT)}[key]
                 config[key] = _bounded_int(value, *limits)
             elif key == "tag":
                 config[key] = str(value or "").strip()[:60]
@@ -192,19 +233,74 @@ class ZlibraryTool(BaseTool):
         stored["accounts"] = [pool.normalize_account(item) for item in config["accounts"]]
         self.api.storage.set_config(stored)
 
-    def _persist_account_state(self, account):
+    def _persist_account_state(self, account, only_if_newer=False,
+                               rotation_cursor=None):
         """只把运行期字段合并回号池，避免下载任务的旧快照覆盖新账号。"""
         with self._persist_lock:
             config = self.load_config()
             fresh = pool.find_account(config["accounts"], account.get("id"))
             if not fresh:
                 return
+            # 身份/凭据已被别的请求改过时，旧快照不能把结果回写上去。
+            for key in _ACCOUNT_IDENTITY_FIELDS:
+                if account.get(key) != fresh.get(key):
+                    logging.warning(
+                        "[ZlibraryTool] skip stale account state for %s (%s)",
+                        account.get("id"), key)
+                    return
+            source_quota_ts = float(account.get("quota_updated_at") or 0)
+            fresh_quota_ts = float(fresh.get("quota_updated_at") or 0)
+            source_state_ts = float(account.get("state_updated_at") or 0)
+            fresh_state_ts = float(fresh.get("state_updated_at") or 0)
+            source_stale_ts = float(account.get("quota_stale_at") or 0)
+            fresh_stale_ts = float(fresh.get("quota_stale_at") or 0)
             for key in _ACCOUNT_RUNTIME_FIELDS:
-                if key == "email" and not account.get(key):
+                if key == "last_used":
+                    fresh[key] = max(float(fresh.get(key) or 0),
+                                     float(account.get(key) or 0))
                     continue
+                if key in ("quota_stale", "quota_stale_at"):
+                    if only_if_newer:
+                        if source_stale_ts == 0:
+                            # 兼容没有独立 stale 时间戳的旧配置。
+                            if source_state_ts < fresh_state_ts:
+                                continue
+                        elif source_stale_ts < fresh_stale_ts:
+                            continue
+                    if key in account:
+                        fresh[key] = account[key]
+                    continue
+                if only_if_newer:
+                    if key in ("quota_today", "quota_limit",
+                               "quota_updated_at"):
+                        if source_quota_ts == 0 or source_quota_ts < fresh_quota_ts:
+                            continue
+                    elif key in ("status", "cooldown_until", "last_error",
+                                 "state_updated_at"):
+                        if source_state_ts == 0 or source_state_ts < fresh_state_ts:
+                            continue
                 if key in account:
                     fresh[key] = account[key]
+            if rotation_cursor is not None:
+                config["rotation_cursor"] = str(rotation_cursor or "")
             self._persist(config)
+
+    def create_task(self, progress_data=None):
+        """后台任务名带上书名，让右上角多本下载可以区分。"""
+        data = dict(progress_data or {})
+        title = str(data.get("book_title") or "").strip().replace("\n", " ")
+        service_item = _(self.service_item_name)
+        if title:
+            service_item = "%s：%s" % (service_item, title[:80])
+        service_type = (self.TOOL_SERVICE_TYPE
+                        or BackgroundTask.SERVICE_TYPE_OTHER)
+        task = BackgroundService().update_task(
+            service_type=service_type,
+            service_item=service_item,
+            progress=0,
+            progress_data=data,
+        )
+        return task.id
 
     # ------------------------------------------------------------- 客户端
 
@@ -276,7 +372,8 @@ class ZlibraryTool(BaseTool):
         config = self.load_config()
         client = self.get_client(config)
         origin = client.origin()
-        filters = filters or {}
+        filters = dict(filters or {})
+        filters["languages"] = _search_language_names(filters.get("languages"))
         try:
             if client.probe_eapi(origin):
                 result = client.eapi_search(
@@ -285,16 +382,20 @@ class ZlibraryTool(BaseTool):
             else:
                 origin = client.origin()
                 result = client.html_search(
-                    origin, q, page, timeout=min(config["timeout"], 60))
+                    origin, q, page, filters=filters,
+                    timeout=min(config["timeout"], 60))
         except ZlibError as err:
             if err.code in ("eapi.http", "eapi.rejected"):
                 origin = client.origin()
                 if client.probe_eapi(origin):
                     with client._lock:
+                        # 只对本次探测的域关闭 EAPI，避免并发换域时误标新域。
                         client._eapi = False
+                        client._eapi_origin = origin
                     origin = client.origin()
                     result = client.html_search(
-                        origin, q, page, timeout=min(config["timeout"], 60))
+                        origin, q, page, filters=filters,
+                        timeout=min(config["timeout"], 60))
                 else:
                     raise
             else:
@@ -340,15 +441,21 @@ class ZlibraryTool(BaseTool):
     def _is_active(job):
         return bool(job) and job.get("status") in ("starting", "running")
 
+    @staticmethod
+    def _is_live(job):
+        return bool(job) and job.get("status") in (
+            "queued", "starting", "running")
+
     @classmethod
     def _gc_jobs_locked(cls):
         now = time.time()
         expired = [job_id for job_id, job in cls._jobs.items()
-                   if not cls._is_active(job)
+                   if not cls._is_live(job)
                    and now - job.get("updated_at", 0) > _JOB_KEEP]
         for job_id in expired:
             cls._jobs.pop(job_id, None)
             cls._cancel_events.pop(job_id, None)
+            cls._job_meta.pop(job_id, None)
         if len(cls._jobs) <= _MAX_JOB_RECORDS:
             return
         ordered = sorted(cls._jobs.items(),
@@ -356,9 +463,10 @@ class ZlibraryTool(BaseTool):
         for job_id, job in ordered:
             if len(cls._jobs) <= _MAX_JOB_RECORDS:
                 break
-            if not cls._is_active(job):
+            if not cls._is_live(job):
                 cls._jobs.pop(job_id, None)
                 cls._cancel_events.pop(job_id, None)
+                cls._job_meta.pop(job_id, None)
 
     @classmethod
     def is_running(cls):
@@ -369,6 +477,12 @@ class ZlibraryTool(BaseTool):
     def active_count(cls):
         with cls._jobs_lock:
             return len([job for job in cls._jobs.values() if cls._is_active(job)])
+
+    @classmethod
+    def queued_count(cls):
+        with cls._jobs_lock:
+            return len([job for job in cls._jobs.values()
+                        if job.get("status") == "queued"])
 
     @classmethod
     def snapshot(cls, job_id=None):
@@ -390,7 +504,18 @@ class ZlibraryTool(BaseTool):
             cls._gc_jobs_locked()
             jobs = sorted(cls._jobs.values(),
                           key=lambda job: job.get("created_at", 0))
-            return [dict(job) for job in jobs]
+            queued = [job["job_id"] for job in jobs
+                      if job.get("status") == "queued"]
+            positions = {job_id: index + 1
+                         for index, job_id in enumerate(queued)}
+            result = []
+            for job in jobs:
+                item = dict(job)
+                if item.get("status") == "queued":
+                    item["queue_position"] = positions[item["job_id"]]
+                    item["queue_length"] = len(queued)
+                result.append(item)
+            return result
 
     @classmethod
     def _update(cls, job_id, **fields):
@@ -402,29 +527,86 @@ class ZlibraryTool(BaseTool):
             job["updated_at"] = time.time()
 
     @classmethod
-    def _begin(cls, job_id, token, title):
+    def _begin(cls, job_id, token, title, user_id=None, work_dir=None,
+               account_id=None, book=None):
         with cls._jobs_lock:
             cls._gc_jobs_locked()
-            active = [job for job in cls._jobs.values() if cls._is_active(job)]
-            if len(active) >= _MAX_CONCURRENT:
+            queued = [job for job in cls._jobs.values()
+                      if job.get("status") == "queued"]
+            if len(queued) >= _MAX_QUEUE:
                 return False
             now = time.time()
             cls._jobs[job_id] = {
                 "job_id": job_id, "book_token": token, "task_id": None,
-                "status": "starting", "progress": 0, "stage": "prepare",
+                "status": "queued", "progress": 0, "stage": "queued",
                 "current": title or "", "error": "", "detail": "",
                 "downloaded": 0, "total": None, "book_id": None,
                 "results": [], "account": "",
                 "created_at": now, "updated_at": now,
             }
             cls._cancel_events[job_id] = threading.Event()
+            cls._job_meta[job_id] = {
+                "user_id": user_id,
+                "work_dir": work_dir,
+                "account_id": account_id,
+                # 队列可能等待很久，保存入队时的书目，避免搜索缓存过期。
+                "book": dict(book) if isinstance(book, dict) else None,
+            }
             return True
+
+    def _dispatch_jobs(self):
+        """按配置并发数启动排队任务；由入队/任务结束触发，不单独跑调度线程。"""
+        # 配置锁必须在 jobs 锁之外获取，避免与 save_config -> dispatch 形成反向锁序。
+        try:
+            max_jobs = self.load_config().get("max_concurrent", _MAX_CONCURRENT)
+        except Exception:
+            max_jobs = _MAX_CONCURRENT
+        max_jobs = max(1, min(int(max_jobs), _MAX_CONCURRENT_LIMIT))
+        with self._dispatch_lock:
+            while True:
+                with self._jobs_lock:
+                    self._gc_jobs_locked()
+                    queued = [job for job in self._jobs.values()
+                              if job.get("status") == "queued"]
+                    active = [job for job in self._jobs.values()
+                              if self._is_active(job)]
+                    if not queued:
+                        return
+                    if len(active) >= max_jobs:
+                        return
+                    job = sorted(queued,
+                                 key=lambda item: item.get("created_at", 0))[0]
+                    meta = self._job_meta.pop(job["job_id"], None)
+                    if meta is None or meta.get("user_id") is None:
+                        # 没有宿主上下文的队列项无法执行，标记失败并跳过，不能卡住队列。
+                        job.update(status="failed", error="task.failed",
+                                   detail="missing job context", stage="done",
+                                   progress=100)
+                        continue
+                    job["status"] = "starting"
+                    job["stage"] = "prepare"
+                    job["updated_at"] = time.time()
+                try:
+                    self.run_download(
+                        meta["user_id"], meta["work_dir"], job["book_token"],
+                        job["job_id"], account_id=meta.get("account_id"),
+                        book_snapshot=meta.get("book"))
+                except Exception as err:
+                    logging.exception("[ZlibraryTool] failed to dispatch job")
+                    self._fail(job["job_id"], None, meta["user_id"],
+                               "task.failed", str(err))
+
+    @classmethod
+    def _finish_meta(cls, job_id):
+        with cls._jobs_lock:
+            cls._job_meta.pop(job_id, None)
 
     @classmethod
     def _discard(cls, job_id):
         with cls._jobs_lock:
             cls._jobs.pop(job_id, None)
             cls._cancel_events.pop(job_id, None)
+            cls._job_meta.pop(job_id, None)
 
     @classmethod
     def _cancel_event(cls, job_id):
@@ -436,7 +618,137 @@ class ZlibraryTool(BaseTool):
     def _origin(self, client):
         return client.origin()
 
-    def _profile_account(self, client, origin, account, config):
+    def _credential_key_path(self):
+        try:
+            base = self.get_work_dir()
+        except Exception:
+            base = os.path.join(
+                getattr(self, "TOOL_DATA_ROOT", "/data/toolbox"),
+                self.tool_id())
+            os.makedirs(base, exist_ok=True)
+        return os.path.join(base, ".credentials.key")
+
+    def _encrypt_password(self, password):
+        try:
+            return credential_store.encrypt_password(
+                password, self._credential_key_path())
+        except Exception as err:
+            logging.error(
+                "[ZlibraryTool] failed to encrypt account password: %s",
+                err.__class__.__name__)
+            raise ZlibError(
+                "accounts.password_store_failed",
+                "无法加密保存密码，请检查工具数据目录权限")
+
+    def _decrypt_password(self, account):
+        try:
+            return credential_store.decrypt_password(
+                account.get("password_enc"), self._credential_key_path())
+        except Exception as err:
+            logging.warning(
+                "[ZlibraryTool] failed to decrypt password for %s: %s",
+                account.get("id"), err.__class__.__name__)
+            return ""
+
+    @staticmethod
+    def _can_auto_renew(account):
+        return bool(account.get("auto_renew")
+                    and account.get("password_enc")
+                    and account.get("email"))
+
+    def _login_with_password(self, client, email, password, config):
+        login = None
+        try:
+            login = client.eapi_login(
+                client.origin(), email, password,
+                timeout=min(config["timeout"], 45))
+        except ZlibError as err:
+            if err.code not in ("accounts.login_failed", "eapi.http",
+                                "eapi.rejected"):
+                raise
+        if login is None:
+            login = client.html_login(
+                client.origin(), email, password,
+                timeout=min(config["timeout"], 45))
+        return login
+
+    def _persist_account_credentials(self, account, expected=None):
+        # 与账号动作的 save_accounts 共用账号锁，避免后台续期刚写入的
+        # 新会话被另一个动作的旧账号快照整表覆盖。
+        with self._account_lock:
+            with self._persist_lock:
+                config = self.load_config()
+                fresh = pool.find_account(config["accounts"], account.get("id"))
+                if not fresh:
+                    return
+                if expected is not None:
+                    for key in _ACCOUNT_IDENTITY_FIELDS:
+                        if key in expected and fresh.get(key) != expected.get(key):
+                            logging.warning(
+                                "[ZlibraryTool] skip stale credentials for %s (%s)",
+                                account.get("id"), key)
+                            return
+                for key in ("remix_userid", "remix_userkey", "bsrv", "cookies",
+                            "email", "password_enc", "auto_renew"):
+                    if key in account:
+                        fresh[key] = account[key]
+                self._persist(config)
+
+    def _persist_discovered_email(self, account):
+        email = str(account.get("email") or "").strip()
+        if not email:
+            return
+        with self._account_lock:
+            with self._persist_lock:
+                config = self.load_config()
+                fresh = pool.find_account(config["accounts"], account.get("id"))
+                if not fresh or fresh.get("email"):
+                    return
+                fresh["email"] = email
+                self._persist(config)
+
+    def _renew_account(self, client, account, config):
+        if not self._can_auto_renew(account):
+            return False
+        expected = {key: account.get(key) for key in _ACCOUNT_IDENTITY_FIELDS}
+        email = str(account.get("email") or "").strip()
+        password = self._decrypt_password(account)
+        if not password:
+            return False
+        login = None
+        try:
+            login = client.eapi_login(
+                client.origin(), email, password,
+                timeout=min(config["timeout"], 45))
+        except ZlibError as err:
+            if err.code not in ("accounts.login_failed", "eapi.http",
+                                "eapi.rejected"):
+                logging.warning(
+                    "[ZlibraryTool] auto renew login failed for %s: %s",
+                    account.get("id"), err.code)
+                return False
+        if login is None:
+            try:
+                login = client.html_login(
+                    client.origin(), email, password,
+                    timeout=min(config["timeout"], 45))
+            except ZlibError as err:
+                logging.warning(
+                    "[ZlibraryTool] auto renew failed for %s: %s",
+                    account.get("id"), err.code)
+                return False
+        if not login:
+            return False
+        pool.merge_login(account, login)
+        account["auto_renew"] = True
+        logging.info("[ZlibraryTool] auto renewed session for %s",
+                     account.get("id"))
+        self._persist_account_credentials(account, expected=expected)
+        return self._profile_account(
+            client, client.origin(), account, config, allow_renew=False)
+
+    def _profile_account(self, client, origin, account, config,
+                         allow_renew=True):
         # EAPI 请求可能刚因读超时换过最终域，调用方手里的 origin 可能已经过期。
         origin = client.origin()
         try:
@@ -444,19 +756,92 @@ class ZlibraryTool(BaseTool):
                                           timeout=min(config["timeout"], 15))
         except ZlibError as err:
             if err.code in ("accounts.session_expired", "accounts.login_failed"):
+                if allow_renew and self._renew_account(client, account, config):
+                    return True
                 pool.mark_error(account, err.code, err.message)
                 return False
             if err.code in ("eapi.http", "eapi.rejected"):
+                account["quota_stale"] = True
+                account["quota_stale_at"] = time.time()
                 return True
             raise
         pool.apply_profile(account, profile)
         if profile.get("email") and not account.get("email"):
             account["email"] = profile["email"]
+            self._persist_discovered_email(account)
         return True
 
     def account_action(self, body):
+        action = str(body.get("action") or "").strip()
+        if action == "refresh":
+            return self._refresh_accounts(body)
         with self._account_lock:
             return self._account_action(body)
+
+    def _refresh_accounts(self, body):
+        with self._refresh_lock:
+            config = self.load_config()
+            client = self.get_client(config)
+            attempted = 0
+            failed = 0
+            now = time.time()
+            entry_error = None
+            entry_checked = False
+            for account in config["accounts"]:
+                attempted += 1
+                if (account.get("status") == pool.STATUS_INVALID
+                        and float(account.get("cooldown_until") or 0) > now):
+                    # 失败续期仍在冷却期：入口刷新不能反复尝试登录。
+                    account["quota_stale"] = True
+                    account["quota_stale_at"] = now
+                    failed += 1
+                    with self._account_lock:
+                        self._persist_account_state(account, only_if_newer=True)
+                    continue
+                if not entry_checked:
+                    # 入口按批解析一次：入口挂了所有账号都过不去，不能让每个
+                    # 账号各自重走一遍完整的跳转/挑战链（4 个账号就是 4 次）。
+                    entry_checked = True
+                    try:
+                        self._origin(client)
+                    except Exception as err:
+                        entry_error = err
+                        logging.warning(
+                            "[ZlibraryTool] quota refresh entry failed for %d "
+                            "accounts: %s: %s", len(config["accounts"]),
+                            getattr(err, "code", err.__class__.__name__), err)
+                if entry_error is not None:
+                    account["quota_stale"] = True
+                    account["quota_stale_at"] = now
+                    failed += 1
+                    with self._account_lock:
+                        self._persist_account_state(account, only_if_newer=True)
+                    continue
+                before = float(account.get("quota_updated_at") or 0)
+                try:
+                    ok = self._profile_account(
+                        client, self._origin(client), account, config,
+                        allow_renew=bool(account.get("enabled")))
+                except Exception as err:
+                    logging.warning(
+                        "[ZlibraryTool] quota refresh failed for %s: %s",
+                        account.get("id"), err)
+                    account["quota_stale"] = True
+                    account["quota_stale_at"] = time.time()
+                    failed += 1
+                else:
+                    after = float(account.get("quota_updated_at") or 0)
+                    if not ok or after <= before:
+                        account["quota_stale"] = True
+                        account["quota_stale_at"] = time.time()
+                        failed += 1
+                with self._account_lock:
+                    self._persist_account_state(account, only_if_newer=True)
+            fresh = self.load_config()
+            return {"accounts": [pool.public_account(item)
+                                 for item in fresh["accounts"]],
+                    "attempted": attempted,
+                    "failed": failed}
 
     def _account_action(self, body):
         action = str(body.get("action") or "").strip()
@@ -467,25 +852,23 @@ class ZlibraryTool(BaseTool):
         now = time.time()
 
         if action == "add":
+            if len(account_list) >= _MAX_ACCOUNTS:
+                raise ZlibError("accounts.limit", "account pool is full")
             mode = str(body.get("mode") or "cookie").strip()
             label = str(body.get("label") or "").strip()
             email = str(body.get("email") or "").strip()
             password = str(body.get("password") or "")
+            save_password = bool(body.get("save_password"))
             if mode == "password":
                 if not email or not password:
                     raise ZlibError("params.missing", "email/password required")
-                login = None
-                try:
-                    login = client.eapi_login(origin, email, password,
-                                              timeout=min(config["timeout"], 45))
-                except ZlibError as err:
-                    if err.code not in ("accounts.login_failed", "eapi.http", "eapi.rejected"):
-                        raise
-                if login is None:
-                    login = client.html_login(client.origin(), email, password,
-                                              timeout=min(config["timeout"], 45))
+                login = self._login_with_password(
+                    client, email, password, config)
                 account = pool.new_account(label, email=email)
                 pool.merge_login(account, login)
+                if save_password:
+                    account["password_enc"] = self._encrypt_password(password)
+                    account["auto_renew"] = True
             else:
                 cookies = body.get("cookies") if isinstance(body.get("cookies"), dict) else {}
                 user_id = str(body.get("remix_userid") or "").strip()
@@ -510,6 +893,34 @@ class ZlibraryTool(BaseTool):
             account_list.append(account)
             self.save_accounts(account_list)
             return {"account": pool.public_account(account), "accounts": [
+                pool.public_account(item) for item in account_list]}
+
+        if action == "update_login":
+            account = pool.find_account(account_list, str(body.get("id") or ""))
+            if not account:
+                raise ZlibError("params.invalid", "account not found")
+            email = str(body.get("email") or "").strip()[:120]
+            password = str(body.get("password") or "")
+            if not email or not password:
+                raise ZlibError("params.missing", "email/password required")
+            login = self._login_with_password(
+                client, email, password, config)
+            candidate = pool.normalize_account(account)
+            candidate["email"] = email
+            candidate["password_enc"] = self._encrypt_password(password)
+            candidate["auto_renew"] = True
+            pool.merge_login(candidate, login)
+            pool.apply_profile(candidate, {})
+            if not self._profile_account(
+                    client, origin, candidate, config, allow_renew=False):
+                raise ZlibError(
+                    "accounts.invalid", "账号登录成功但会话验证失败")
+            for index, item in enumerate(account_list):
+                if item["id"] == candidate["id"]:
+                    account_list[index] = candidate
+                    break
+            self.save_accounts(account_list)
+            return {"account": pool.public_account(candidate), "accounts": [
                 pool.public_account(item) for item in account_list]}
 
         if action == "update":
@@ -561,47 +972,67 @@ class ZlibraryTool(BaseTool):
 
     def _pick_download_locked(self, client, origin, book, config, account_id=None):
         # 必须用锁内重新读取的号池，调用方在下载开始时拿到的 config 可能已经过期。
-        account_list = self.load_config()["accounts"]
-        chosen = []
-        if account_id:
+        runtime_config = self.load_config()
+        account_list = runtime_config["accounts"]
+        rotation = runtime_config.get("rotation", "least_used")
+        manual = bool(account_id)
+        if manual:
             account = pool.find_account(account_list, account_id)
             if not account:
                 raise ZlibError("accounts.invalid", "account not found")
+            if not account.get("enabled"):
+                raise ZlibError("accounts.invalid", "account disabled")
             chosen = [account]
         else:
-            remaining = list(account_list)
-            while True:
-                account = pool.select_account(remaining)
-                if account is None:
-                    break
-                chosen.append(account)
-                remaining = [item for item in remaining if item["id"] != account["id"]]
+            chosen = pool.candidate_accounts(
+                account_list, rotation=rotation,
+                cursor=runtime_config.get("rotation_cursor", ""),
+                now=time.time())
         last_error = None
         for account in chosen:
             if not account.get("enabled"):
                 continue
+            next_cursor = (None if manual or rotation != "round_robin"
+                           else account.get("id"))
             try:
-                # 先占用 last_used，让并发的下一个任务挑到别的号；否则所有任务
-                # 都会在下载完成前选中同一个“最久未用”账号。
-                account["last_used"] = time.time()
-                self._persist_account_state(account)
                 if not self._profile_account(client, origin, account, config):
-                    self._persist_account_state(account)
+                    self._persist_account_state(account, only_if_newer=True)
                     continue
-                self._persist_account_state(account)
+                if (account.get("status") == pool.STATUS_EXHAUSTED
+                        or pool.remaining(account) == 0):
+                    self._persist_account_state(account, only_if_newer=True)
+                    continue
+                self._persist_account_state(account, only_if_newer=True)
                 target = client.prepare_download(
                     client.origin(), book, account=account,
                     timeout=min(config["timeout"], 60))
+                pool.mark_success(account)
+                self._persist_account_state(
+                    account, only_if_newer=True,
+                    rotation_cursor=next_cursor)
                 return target, account
             except ZlibError as err:
+                if err.code in ("accounts.session_expired", "accounts.login_failed"):
+                    if self._renew_account(client, account, config):
+                        try:
+                            target = client.prepare_download(
+                                client.origin(), book, account=account,
+                                timeout=min(config["timeout"], 60))
+                            pool.mark_success(account)
+                            self._persist_account_state(
+                                account, only_if_newer=True,
+                                rotation_cursor=next_cursor)
+                            return target, account
+                        except ZlibError as retry_err:
+                            err = retry_err
                 if err.code in ("accounts.session_expired", "accounts.login_failed",
                                 "download.limit"):
                     pool.mark_error(account, err.code, err.message)
-                    self._persist_account_state(account)
+                    self._persist_account_state(account, only_if_newer=True)
                     last_error = err
                     continue
                 raise
-        if config.get("guest_enabled"):
+        if runtime_config.get("guest_enabled"):
             target = client.prepare_download(
                 client.origin(), book, account=None,
                 timeout=min(config["timeout"], 60))
@@ -611,9 +1042,10 @@ class ZlibraryTool(BaseTool):
         raise ZlibError("accounts.exhausted", "no usable account and guest mode is off")
 
     @AsyncService.register_service
-    def run_download(self, user_id, work_dir, book_token, job_id, account_id=None):
+    def run_download(self, user_id, work_dir, book_token, job_id,
+                     account_id=None, book_snapshot=None):
         """服务队列只负责派发；每个任务一条线程，避免单队列把下载串行化。"""
-        args = (user_id, work_dir, book_token, job_id, account_id)
+        args = (user_id, work_dir, book_token, job_id, account_id, book_snapshot)
         try:
             threaded = bool(AsyncService().async_mode())
         except Exception:
@@ -631,10 +1063,12 @@ class ZlibraryTool(BaseTool):
             shutil.rmtree(work_dir, ignore_errors=True)
             self._fail(job_id, None, user_id, "task.failed", str(err))
 
-    def _job_thread(self, user_id, work_dir, book_token, job_id, account_id=None):
+    def _job_thread(self, user_id, work_dir, book_token, job_id,
+                    account_id=None, book_snapshot=None):
         scoped = getattr(self, "scoped_session", None)
         try:
-            self._download_job(user_id, work_dir, book_token, job_id, account_id)
+            self._download_job(user_id, work_dir, book_token, job_id,
+                               account_id, book_snapshot)
         except BaseException as err:
             logging.exception("[ZlibraryTool] download thread aborted")
             snap = self.snapshot(job_id)
@@ -657,26 +1091,45 @@ class ZlibraryTool(BaseTool):
         except Exception as err:
             logging.warning("[ZlibraryTool] task progress update failed: %s", err)
 
+    def _notify_user(self, user_id, status, message):
+        if not user_id:
+            return
+        try:
+            self.add_msg(user_id, status, message)
+        except Exception as err:
+            # 站内信是后置通知，失败不能改变下载/入库任务的最终状态。
+            logging.warning("[ZlibraryTool] send message failed: %s", err)
+
     def _download_job(self, user_id, work_dir, book_token, job_id,
-                      account_id=None):
+                      account_id=None, book_snapshot=None):
         task_id = None
         cancel_event = self._cancel_event(job_id) or threading.Event()
         try:
-            task_id = self.api.tasks.create_task({"stage": "prepare"})
-            self._update(job_id, task_id=task_id, status="running",
-                         stage="downloading", progress=3)
-            self._report_task(task_id, 3, {"stage": "downloading"})
             config = self.load_config()
             client = self.get_client(config)
-            book = self.load_book(book_token)
+            # 入队时保存的书目快照优先，避免排队超过搜索缓存 TTL 后 token 失效。
+            book = book_snapshot if book_snapshot else self.load_book(book_token)
             origin = client.origin()
             title = (book.get("title") or "").strip()
             author = (book.get("author") or "").strip()
             ext = str(book.get("extension") or "epub").lower()
             if not re.fullmatch(r"[a-z0-9]{1,8}", ext):
                 ext = "epub"
+            # 书名先于任务创建，让宿主右上角任务列表能区分并发下载。
+            task_id = self.api.tasks.create_task({
+                "stage": "prepare", "book_title": title})
+            self._update(job_id, task_id=task_id, status="running",
+                         stage="downloading", progress=3)
+            self._report_task(task_id, 3, {
+                "stage": "downloading", "book_title": title})
+            if cancel_event.is_set():
+                self._finish_cancelled(job_id, task_id, user_id)
+                return
             target, used_account = self._pick_download(
                 client, origin, book, config, account_id=account_id)
+            if cancel_event.is_set():
+                self._finish_cancelled(job_id, task_id, user_id)
+                return
             filename = "%s.%s" % (
                 zlib_client.sanitize_filename(title, book.get("id") or "book"), ext)
             dest = os.path.join(work_dir, filename)
@@ -711,25 +1164,40 @@ class ZlibraryTool(BaseTool):
                     user_id, dest, title, [author] if author else [],
                     delete_after_import=True)
                 self._apply_tag(book_id, config.get("tag", ""))
+            self._notify_user(
+                user_id, "success",
+                _("Z-Library 入库成功：%s") % (title or filename))
             if used_account is not None:
-                with self._account_lock:
-                    pool.mark_success(used_account)
-                    try:
-                        self._profile_account(client, origin, used_account, config)
-                    except Exception as err:
-                        logging.warning(
-                            "[ZlibraryTool] quota refresh failed: %s", err)
-                    self._persist_account_state(used_account)
+                try:
+                    with self._account_lock:
+                        pool.mark_success(used_account)
+                        try:
+                            self._profile_account(
+                                client, origin, used_account, config)
+                        except Exception as err:
+                            logging.warning(
+                                "[ZlibraryTool] quota refresh failed: %s", err)
+                        self._persist_account_state(
+                            used_account, only_if_newer=True)
+                except Exception as err:
+                    # 书已经入库，账号状态回写失败不能翻转任务结果。
+                    logging.warning(
+                        "[ZlibraryTool] post-import account update failed: %s",
+                        err)
             self._report_task(task_id, 100,
                               {"stage": "done", "book_id": book_id})
-            self.api.tasks.complete_task(task_id)
+            try:
+                self.api.tasks.complete_task(task_id)
+            except Exception as err:
+                logging.warning(
+                    "[ZlibraryTool] complete background task failed: %s", err)
             self._update(job_id, status="completed", progress=100,
                          stage="done", book_id=book_id, current=title,
                          account=(used_account or {}).get("label", "游客"),
                          results=[_result_row(filename, "imported",
                                               book_id=book_id)])
         except ZlibError as err:
-            if err.code == "cancelled":
+            if err.code == "cancelled" or cancel_event.is_set():
                 self._finish_cancelled(job_id, task_id, user_id)
                 return
             self._fail(job_id, task_id, user_id, err.code, err.message)
@@ -738,6 +1206,8 @@ class ZlibraryTool(BaseTool):
             self._fail(job_id, task_id, user_id, "task.failed", str(err))
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+            self._finish_meta(job_id)
+            self._dispatch_jobs()
 
     def _fail(self, job_id, task_id, user_id, code, detail):
         if task_id is not None:
@@ -745,7 +1215,10 @@ class ZlibraryTool(BaseTool):
             self.api.tasks.complete_task(task_id, error_message=detail or code)
         self._update(job_id, status="failed", error=code, detail=detail,
                      stage="done", progress=100)
-        self.add_msg(user_id, "danger", _("下载/入库失败：%s") % (detail or code))
+        self._finish_meta(job_id)
+        self._notify_user(
+            user_id, "danger", _("下载/入库失败：%s") % (detail or code))
+        self._dispatch_jobs()
 
     def _finish_cancelled(self, job_id, task_id, user_id):
         if task_id is not None:
@@ -753,7 +1226,9 @@ class ZlibraryTool(BaseTool):
             self.api.tasks.complete_task(task_id, error_message=_("已取消"))
         self._update(job_id, status="cancelled", error="cancelled",
                      stage="done", progress=100)
-        self.add_msg(user_id, "warning", _("下载已取消"))
+        self._finish_meta(job_id)
+        self._notify_user(user_id, "warning", _("下载已取消"))
+        self._dispatch_jobs()
 
     def _apply_tag(self, book_id, tag):
         if not tag:
@@ -905,19 +1380,19 @@ class DownloadHandler(BaseHandler):
         job_id = uuid.uuid4().hex[:16]
         work_dir = tool.api.storage.get_work_dir(job_id)
         os.makedirs(work_dir, exist_ok=True)
-        if not ZlibraryTool._begin(job_id, token, book.get("title") or ""):
+        if not ZlibraryTool._begin(
+                job_id, token, book.get("title") or "",
+                user_id=self.current_user.id, work_dir=work_dir,
+                account_id=account_id, book=book):
             shutil.rmtree(work_dir, ignore_errors=True)
             return {"err": "task.limit",
-                    "msg": _("同时下载任务已达上限（%d 个）") % _MAX_CONCURRENT}
-        try:
-            tool.run_download(self.current_user.id, work_dir, token, job_id,
-                              account_id=account_id)
-        except Exception:
-            ZlibraryTool._discard(job_id)
-            shutil.rmtree(work_dir, ignore_errors=True)
-            raise
-        return {"err": "ok", "data": {"job_id": job_id},
-                "msg": _("下载任务已启动")}
+                    "msg": _("下载队列已满，请稍后再试")}
+        tool._dispatch_jobs()
+        snap = ZlibraryTool.snapshot(job_id)
+        return {"err": "ok", "data": {
+            "job_id": job_id,
+            "queued": snap.get("status") == "queued",
+        }, "msg": _("下载任务已加入队列")}
 
 
 class ProgressHandler(BaseHandler):
@@ -930,8 +1405,10 @@ class ProgressHandler(BaseHandler):
         data["jobs"] = jobs
         data["active"] = len([job for job in jobs
                               if job.get("status") in ("starting", "running")])
+        data["queued"] = len([job for job in jobs
+                              if job.get("status") == "queued"])
         if not data["jobs"]:
-            data = {"status": "idle", "jobs": [], "active": 0}
+            data = {"status": "idle", "jobs": [], "active": 0, "queued": 0}
         return {"err": "ok", "msg": "", "data": data}
 
 
@@ -941,22 +1418,35 @@ class CancelHandler(BaseHandler):
     def post(self):
         body = _json_body(self)
         job_id = str(body.get("job_id") or "").strip()
+        queued_cancel = []
         with ZlibraryTool._jobs_lock:
+            jobs = list(ZlibraryTool._jobs.values())
+            if job_id:
+                jobs = [job for job in jobs if job["job_id"] == job_id]
+            for job in jobs:
+                if job.get("status") == "queued":
+                    job.update(status="cancelled", stage="done",
+                               progress=100, error="cancelled")
+                    meta = ZlibraryTool._job_meta.pop(job["job_id"], None)
+                    ZlibraryTool._cancel_events.pop(job["job_id"], None)
+                    if meta:
+                        queued_cancel.append(meta)
             active = {
                 jid: event
                 for jid, event in ZlibraryTool._cancel_events.items()
                 if ZlibraryTool._is_active(ZlibraryTool._jobs.get(jid))
+                and (not job_id or jid == job_id)
             }
-            if job_id:
-                event = active.get(job_id)
-                if event is None:
-                    return {"err": "task.not_running",
-                            "msg": _("当前没有进行中的下载任务")}
-                event.set()
-                return {"err": "ok", "msg": _("已请求取消")}
-            if not active:
+            if not queued_cancel and not active:
                 return {"err": "task.not_running",
                         "msg": _("当前没有进行中的下载任务")}
             for event in active.values():
                 event.set()
-            return {"err": "ok", "msg": _("已请求取消")}
+        tool = ZlibraryTool()
+        for meta in queued_cancel:
+            work_dir = meta.get("work_dir")
+            if work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            tool._notify_user(meta.get("user_id"), "warning", _("下载已取消"))
+        tool._dispatch_jobs()
+        return {"err": "ok", "msg": _("已请求取消")}
