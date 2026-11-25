@@ -138,9 +138,9 @@ class ZlibraryTool(BaseTool):
             "tool_id": "zlibrary",
             "name": "Z-Library 入库",
             "description": "从 zlib.ch 入口搜索 Z-Library 并下载入库，支持号池轮换（自用）",
-            "revision": "0.3.0",
+            "revision": "0.3.1",
             "author": "黏菌",
-            "publish_date": "2026-11-20",
+            "publish_date": "2026-11-25",
             "repo_url": "https://github.com/shiningsprk-arch/tool_zlibrary",
         }
 
@@ -367,6 +367,37 @@ class ZlibraryTool(BaseTool):
                 raise ZlibError("book.expired", "search result expired")
             return dict(book)
 
+    def _search_accounts(self, config):
+        """搜索不消耗下载额度，额度耗尽的账号同样可用；只排除没有会话的。"""
+        accounts = [account for account in config.get("accounts") or []
+                    if account.get("enabled") and account.get("remix_userid")
+                    and account.get("remix_userkey")]
+        accounts.sort(key=lambda account: (
+            account.get("status") == pool.STATUS_INVALID,
+            float(account.get("last_used") or 0),
+        ))
+        return accounts
+
+    def _eapi_search_with_pool(self, client, config, origin, q, page, filters):
+        # 国内入口对游客关闭了搜索端点，必须带账号；官方域游客也能用，
+        # 所以账号全部失败后仍退回游客再试一次。
+        for account in self._search_accounts(config):
+            try:
+                return client.eapi_search(
+                    origin, q, page, config["search_limit"], filters,
+                    account=account, timeout=min(config["timeout"], 60))
+            except ZlibError as err:
+                if err.code not in ("accounts.session_expired",
+                                    "accounts.login_failed",
+                                    "eapi.http", "eapi.rejected"):
+                    raise
+                logging.info(
+                    "[ZlibraryTool] EAPI search with account %s failed: %s",
+                    account.get("id"), err.code)
+        return client.eapi_search(
+            origin, q, page, config["search_limit"], filters,
+            timeout=min(config["timeout"], 60))
+
     @AsyncService.register_function
     def search_sync(self, q, page, filters, timeout):
         config = self.load_config()
@@ -376,9 +407,8 @@ class ZlibraryTool(BaseTool):
         filters["languages"] = _search_language_names(filters.get("languages"))
         try:
             if client.probe_eapi(origin):
-                result = client.eapi_search(
-                    origin, q, page, config["search_limit"], filters,
-                    timeout=min(config["timeout"], 60))
+                result = self._eapi_search_with_pool(
+                    client, config, origin, q, page, filters)
             else:
                 origin = client.origin()
                 result = client.html_search(

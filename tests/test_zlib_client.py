@@ -921,6 +921,20 @@ class EapiTest(unittest.TestCase):
         self.assertEqual(data["order"], "newest")
         self.assertEqual(data["e"], "1")
 
+    def test_search_headers_include_mobile_source_and_account(self):
+        client = zlib_client.ZlibClient("https://example.test/", "system", 5)
+        account = {"remix_userid": "1001", "remix_userkey": "key"}
+        headers = client._eapi_headers(account, post=True)
+        self.assertEqual(headers["source"], "android")
+        self.assertEqual(headers["remix-userid"], "1001")
+        self.assertEqual(headers["remix-userkey"], "key")
+
+        captured = {}
+        client._eapi_json = lambda *a, **kw: captured.update(kw) or {
+            "books": [], "pagination": {}}
+        client.eapi_search("https://origin.test", "q", 1, 20, account=account)
+        self.assertEqual(captured["account"], account)
+
     def test_html_search_passes_filters(self):
         client = zlib_client.ZlibClient("https://example.test/", "system", 5)
         captured = {}

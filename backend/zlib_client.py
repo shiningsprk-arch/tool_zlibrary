@@ -780,7 +780,7 @@ class ZlibClient(object):
         try:
             response = self._request(
                 "GET", origin + "/eapi/info/domains",
-                headers={"Accept": "application/json"},
+                headers={"Accept": "application/json", "source": "android"},
                 allow_redirects=False,
                 timeout=min(self.timeout, _EAPI_PROBE_TIMEOUT_MAX))
             payload = _json_payload(response)
@@ -834,7 +834,9 @@ class ZlibClient(object):
     # ---------------------------------------------------------------- EAPI
 
     def _eapi_headers(self, account=None, post=False):
-        headers = {"Accept": "application/json"}
+        # 官方域和国内入口都按移动端校验：缺 source 头时 /eapi/book/search
+        # 返回 400 Access denied，其余 EAPI 端点不受影响。
+        headers = {"Accept": "application/json", "source": "android"}
         if post:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         if account:
@@ -953,7 +955,8 @@ class ZlibClient(object):
             "has_quota": limit_value is not None,
         }
 
-    def eapi_search(self, origin, query, page, limit, filters=None, timeout=None):
+    def eapi_search(self, origin, query, page, limit, filters=None, timeout=None,
+                    account=None):
         filters = filters or {}
         data = {
             "message": query,
@@ -975,7 +978,7 @@ class ZlibClient(object):
             if extension:
                 data.setdefault("extensions[]", []).append(str(extension).lower())
         payload = self._eapi_json("POST", origin, "/eapi/book/search",
-                                  data=data, timeout=timeout)
+                                  data=data, account=account, timeout=timeout)
         books = []
         for raw in payload.get("books") or []:
             if not isinstance(raw, dict):

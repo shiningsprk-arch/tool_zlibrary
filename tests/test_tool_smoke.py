@@ -196,7 +196,9 @@ class FakeClient(object):
     def probe_eapi(self, origin, force=False):
         return True
 
-    def eapi_search(self, origin, query, page, limit, filters=None, timeout=None):
+    def eapi_search(self, origin, query, page, limit, filters=None, timeout=None,
+                    account=None):
+        self.last_search_account = account
         return {
             "books": [{
                 "id": "123", "hash": "abcdef", "md5": "", "sha256": "",
@@ -358,7 +360,8 @@ class SearchSmoke(SmokeBase):
     def test_search_maps_iso_language_codes_to_search_names(self):
         captured = {}
 
-        def fake_search(origin, query, page, limit, filters=None, timeout=None):
+        def fake_search(origin, query, page, limit, filters=None, timeout=None,
+                        account=None):
             captured["filters"] = filters
             return {"books": [], "pagination": {}, "source": "eapi"}
 
@@ -368,6 +371,28 @@ class SearchSmoke(SmokeBase):
         }, 30)
         self.assertEqual(
             captured["filters"]["languages"], ["chinese", "japanese"])
+
+    def test_search_prefers_account_and_falls_back_to_guest(self):
+        account = pool.new_account("A", remix_userid="1001",
+                                   remix_userkey="key-abcdef")
+        self.api._config = {"accounts": [account]}
+        self.tool.search_sync("q", 1, {}, 30)
+        self.assertEqual(self.client.last_search_account["id"], account["id"])
+
+        calls = []
+
+        def deny(origin, query, page, limit, filters=None, timeout=None,
+                 account=None):
+            calls.append(bool(account))
+            if account:
+                raise zlib_client.ZlibError(
+                    "accounts.session_expired", "expired")
+            return {"books": [], "pagination": {}, "source": "eapi"}
+
+        self.client.eapi_search = deny
+        data = self.tool.search_sync("q", 1, {}, 30)
+        self.assertEqual(data["source"], "eapi")
+        self.assertEqual(calls, [True, False])
 
     def test_search_returns_opaque_token_and_caches_book(self):
         data = self.tool.search_sync("q", 1, {}, 30)
